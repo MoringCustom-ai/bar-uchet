@@ -45,7 +45,11 @@ textarea{min-height:140px;font-size:13px}
 .bad{color:var(--red);font-weight:600}
 .soon{color:var(--amber);font-weight:600}
 .num{width:92px;flex:none;text-align:right;font-size:16px}
-.num.filled{border-color:var(--acc)}
+.num.filled{border-color:var(--acc);font-weight:600}
+.stepper{display:flex;align-items:center;gap:4px;flex:none}
+.stepper .num{width:64px;text-align:center}
+.pm{width:38px;height:40px;border:0;border-radius:10px;background:var(--bg2);color:var(--acc);font-size:22px;line-height:1;touch-action:manipulation}
+.pm:active{background:var(--acc);color:var(--acctx)}
 .val{flex:none;text-align:right;font-weight:600}
 .btn{display:block;width:100%;border:0;border-radius:12px;padding:12px;background:var(--acc);color:var(--acctx);font:inherit;font-weight:600;margin:10px 0}
 .btn.sec{background:var(--bg2);color:var(--acc)}
@@ -312,7 +316,20 @@ function parseIng(line){
   return [p[0], null, p[2] || p[1] || ''];
 }
 const ingLine = ([n, qn, u]) => `${n}; ${qn == null ? '' : String(qn).replace('.', ',')}; ${u}`;
-const byCat = list => Object.keys(CATS).map(c => [c, list.filter(i => i.c === c).sort((a,b) => a.n.localeCompare(b.n, 'ru'))]).filter(x => x[1].length);
+// Разделы идут в порядке списка позиций (как в листе «ОСТАТКИ»), без раздела — по категории
+const secOf = it => it.g || CATS[it.c].n;
+function bySec(list){
+  const m = new Map();
+  for (const it of list) { const k = secOf(it); if (!m.has(k)) m.set(k, []); m.get(k).push(it); }
+  return [...m];
+}
+// Ставит позицию в конец её раздела
+function placeItem(it){
+  S.items = S.items.filter(x => x !== it);
+  let last = -1;
+  S.items.forEach((x, i) => { if (secOf(x) === secOf(it)) last = i; });
+  if (last < 0) S.items.push(it); else S.items.splice(last + 1, 0, it);
+}
 
 /* ---------- экраны ---------- */
 const VIEWS = {};
@@ -340,17 +357,36 @@ function inputList(){
   const ql = q.trim().toLowerCase();
   const list = S.items.filter(i => (catF === 'all' || i.c === catF) && (!ql || i.n.toLowerCase().includes(ql)));
   if (!list.length) return `<div class="card"><div class="empty">Ничего не найдено</div></div>`;
-  return byCat(list).map(([c, items]) => `<div class="card"><h3>${CATS[c].n}</h3>${items.map(it => {
+  return bySec(list).map(([g, items]) => `<div class="card"><h3>${esc(g)}</h3>${items.map(it => {
     const s = stockAt(it.id), lc = lastCount(it.id);
     let sub = `сейчас ${s == null ? '—' : fmt(s) + ' ' + esc(it.u)}`;
+    if (it.step > 0 && s != null) sub += ` (${fmt(Math.round(s/it.step*10)/10)} ✅)`;
     if (isNum(it.par)) sub += ` · норма ${fmt(it.par)}`;
     if (lc && mode !== 'r') sub += ` · посч. ${fmtD(lc[0])}`;
     sub += shelfText(it, shelf(it));
-    const ph = mode === 'r' ? '+ ' + it.u : it.u;
+    // в поле серым — текущий остаток; ± меняют его на одну «галочку»
+    const ph = mode === 'r' ? '+ ' + it.u : s == null ? it.u : fmt(s);
+    const st = stepOf(it);
+    const inp = `<input class="num ${d[it.id] ? 'filled' : ''}" data-id="${it.id}" inputmode="decimal" enterkeyhint="next" placeholder="${esc(ph)}" value="${esc(d[it.id] || '')}" autocomplete="off">`;
     return `<div class="row ${needs(it, s) ? 'low' : ''}"><div class="ri"><div class="nm">${esc(it.n)}</div><div class="sub">${sub}${hasRec(it) ? ` · <button class="mini" data-act="rec" data-id="${it.id}">ТТК</button>` : ''}</div></div>
-      <input class="num ${d[it.id] ? 'filled' : ''}" data-id="${it.id}" inputmode="decimal" enterkeyhint="next" placeholder="${esc(ph)}" value="${esc(d[it.id] || '')}" autocomplete="off"></div>`;
+      ${st ? `<div class="stepper"><button class="pm" data-act="bump" data-id="${it.id}" data-dir="-1" aria-label="Минус">−</button>${inp}<button class="pm" data-act="bump" data-id="${it.id}" data-dir="1" aria-label="Плюс">+</button></div>` : inp}</div>`;
   }).join('')}</div>`).join('');
 }
+// Шаг кнопок ±: «галочка» позиции, для штучного — 1, для остального ± нет (только ввод числом)
+const stepOf = it => it.step > 0 ? it.step : ['шт','бут','уп','порц','кор'].includes(it.u) ? 1 : 0;
+ACT.bump = b => {
+  const id = b.dataset.id, it = S.items.find(i => i.id === +id), st = stepOf(it);
+  if (!st) return;
+  const d = drafts[mode];
+  let base = num(d[id]);
+  if (base == null || Number.isNaN(base)) base = mode === 'r' ? 0 : (stockAt(it.id) ?? 0);
+  const v = Math.max(0, Math.round((base + +b.dataset.dir * st)*1000)/1000);
+  if (mode === 'r' && v === 0) delete d[id]; else d[id] = String(v).replace('.', ',');
+  const el = document.querySelector(`#list .num[data-id="${id}"]`);
+  if (el) { el.value = d[id] || ''; el.classList.toggle('filled', !!d[id]); }
+  try { TG.HapticFeedback.selectionChanged(); } catch(e) {}
+  updateSaveBar();
+};
 function updateSaveBar(){
   const bar = $('#savebar');
   if (tab !== 'input' || !S.items.length) { bar.innerHTML = ''; return; }
@@ -411,7 +447,8 @@ VIEWS.order = () => {
     return `<div class="card"><div class="hdr"><h3>${esc(title)}</h3><span><button class="mini" data-act="copy" data-i="${i}">Копировать</button>${IN_TG ? ` · <button class="mini" data-act="share" data-i="${i}">Отправить</button>` : ''}</span></div>${rows.map(line).join('')}</div>`;
   };
   const today = new Date().toLocaleDateString('ru-RU');
-  const sortN = a => a.sort((x,y) => x.it.n.localeCompare(y.it.n, 'ru'));
+  const pos = new Map(S.items.map((it, i) => [it, i]));
+  const sortN = a => a.sort((x,y) => pos.get(x.it) - pos.get(y.it));
   let html = '';
   if (exp.length) {
     exp.sort((a,b) => a.sh.exp - b.sh.exp);
@@ -436,18 +473,23 @@ ACT.copy = b => copyText(TXT[b.dataset.i]);
 // ТТК с пересчётом на количество
 let recId = null;
 const recK = () => { const k = num($('#f_k').value); return k > 0 ? k : 0; };
+// ТТК записана на одну партию. Если позиция в л/мл и известен выход — пересчёт по объёму, иначе 1 ед. = 1 партия
+const VOL = {'л': 1000, 'мл': 1};
+const byVol = it => !!(VOL[it.u] && it.rec.out > 0);
+const recF = (it, k) => byVol(it) ? k * VOL[it.u] / it.rec.out : k;
 function recBody(){
   const it = S.items.find(i => i.id === recId), k = recK();
   if (!it || !k) return '<div class="empty">Впиши количество</div>';
-  return `<table><tr><th>Ингредиент</th><th>на ${fmt(k)} ${esc(it.u)}</th></tr>${it.rec.ing.map(([n, qn, u]) => `<tr><td>${esc(n)}</td><td><b>${qn == null ? '' : fmtQ(qn*k)}</b> ${esc(u)}</td></tr>`).join('')}</table>
-    ${it.rec.out ? `<div class="note">Выход: ${fmtQ(it.rec.out*k)} мл</div>` : ''}`;
+  const f = recF(it, k);
+  return `<table><tr><th>Ингредиент</th><th>на ${fmt(k)} ${esc(it.u)}</th></tr>${it.rec.ing.map(([n, qn, u]) => `<tr><td>${esc(n)}</td><td><b>${qn == null ? '' : fmtQ(qn*f)}</b> ${esc(u)}</td></tr>`).join('')}</table>
+    ${it.rec.out ? `<div class="note">Выход: ${fmtQ(it.rec.out*f)} мл</div>` : ''}`;
 }
 ACT.rec = b => {
   const it = S.items.find(i => i.id === +b.dataset.id);
   if (!it || !hasRec(it)) return;
   recId = it.id;
-  const k = +b.dataset.k > 0 ? +b.dataset.k : 1;
-  openModal(`<h3>${esc(it.n)}</h3><div class="note">ТТК на 1 ${esc(it.u)}${it.rec.out ? ` · выход ${fmt(it.rec.out)} мл` : ''}</div>
+  const k = +b.dataset.k > 0 ? +b.dataset.k : byVol(it) ? it.rec.out / VOL[it.u] : 1;
+  openModal(`<h3>${esc(it.n)}</h3><div class="note">${byVol(it) ? `ТТК на ${fmt(it.rec.out)} мл` : `ТТК на 1 ${esc(it.u)}${it.rec.out ? ` · выход ${fmt(it.rec.out)} мл` : ''}`}</div>
     <div class="row"><div class="ri nm">Сколько сделать, ${esc(it.u)}</div><input id="f_k" class="num" inputmode="decimal" value="${String(k).replace('.', ',')}" autocomplete="off"></div>
     <div class="chips">${[0.5, 1, 1.5, 2, 3].map(v => `<button class="chip" data-act="reck" data-v="${v}">${fmt(v)}</button>`).join('')}</div>
     <div id="recbody"></div>
@@ -459,7 +501,8 @@ ACT.reck = b => { $('#f_k').value = String(b.dataset.v).replace('.', ','); $('#r
 ACT.reccopy = () => {
   const it = S.items.find(i => i.id === recId), k = recK();
   if (!it || !k) return;
-  copyText(`${it.n} × ${fmt(k)} ${it.u}:\n` + it.rec.ing.map(([n, qn, u]) => `— ${n}: ${qn == null ? '' : fmtQ(qn*k)} ${u}`.trimEnd()).join('\n') + (it.rec.out ? `\nВыход: ${fmtQ(it.rec.out*k)} мл` : ''));
+  const f = recF(it, k);
+  copyText(`${it.n} — ${fmt(k)} ${it.u}:\n` + it.rec.ing.map(([n, qn, u]) => `— ${n}: ${qn == null ? '' : fmtQ(qn*f)} ${u}`.trimEnd()).join('\n') + (it.rec.out ? `\nВыход: ${fmtQ(it.rec.out*f)} мл` : ''));
 };
 ACT.share = b => TG.openTelegramLink('https://t.me/share/url?url=' + encodeURIComponent(TXT[b.dataset.i]));
 
@@ -467,8 +510,8 @@ VIEWS.stats = () => {
   if (!S.items.length) return `<div class="card"><div class="empty">Сначала добавь позиции</div></div>`;
   let html = `<div class="seg">${[[7,'Последние 7 дней'],[30,'30 дней']].map(([k,n]) => `<button data-act="period" data-v="${k}" class="${period === k ? 'on' : ''}">${n}</button>`).join('')}</div>
     <div class="note">Расход = было + пришло − осталось, пересчитан на неделю. Нужно минимум 2 пересчёта.</div>`;
-  for (const [c, items] of byCat(S.items)) {
-    html += `<div class="card"><h3>${CATS[c].n}</h3><table><tr><th>Позиция</th><th>в неделю</th><th>есть</th><th>хватит</th></tr>${items.map(it => {
+  for (const [g, items] of bySec(S.items)) {
+    html += `<div class="card"><h3>${esc(g)}</h3><table><tr><th>Позиция</th><th>в неделю</th><th>есть</th><th>хватит</th></tr>${items.map(it => {
       const r = dailyRate(it.id, period), s = stockAt(it.id);
       const left = r > 0 && s != null ? s/r : null;
       return `<tr><td>${esc(it.n)}</td><td>${r == null ? '—' : fmt(r*7) + ' ' + esc(it.u)}</td><td>${fmt(s)}</td><td class="${left != null && left < 2 ? 'warn' : ''}">${left == null ? '—' : left >= 60 ? '60+ дн' : fmt(Math.floor(left*10)/10) + ' дн'}</td></tr>`;
@@ -495,7 +538,7 @@ ACT.inv = b => {
   const t = +b.dataset.t;
   const prev = S.invs.filter(v => v.t < t).sort((a,b) => b.t - a.t)[0];
   const rows = [];
-  for (const [c, items] of byCat(S.items)) for (const it of items) {
+  for (const [g, items] of bySec(S.items)) for (const it of items) {
     const h = H[it.id] || [];
     const cnt = h.find(e => e[0] === t && e[2] === 'c');
     let cons = null;
@@ -503,11 +546,11 @@ ACT.inv = b => {
       const s0 = stockAt(it.id, prev.t);
       if (s0 != null) cons = s0 + h.filter(e => e[2] === 'r' && e[0] > prev.t && e[0] <= t).reduce((a,e) => a + e[3], 0) - cnt[3];
     }
-    rows.push({it, c, q: cnt ? cnt[3] : null, cons});
+    rows.push({it, g, q: cnt ? cnt[3] : null, cons});
   }
   const title = 'Инвентаризация ' + new Date(t*1000).toLocaleDateString('ru-RU');
   const tsv = [title, '', ['Категория','Позиция','Ед.','Остаток', prev ? 'Расход с ' + new Date(prev.t*1000).toLocaleDateString('ru-RU') : 'Расход'].join('\t'),
-    ...rows.map(r => [CATS[r.c].n, r.it.n, r.it.u, r.q == null ? '' : String(r.q).replace('.', ','), r.cons == null ? '' : String(Math.round(r.cons*100)/100).replace('.', ',')].join('\t'))].join('\n');
+    ...rows.map(r => [r.g, r.it.n, r.it.u, r.q == null ? '' : String(r.q).replace('.', ','), r.cons == null ? '' : String(Math.round(r.cons*100)/100).replace('.', ',')].join('\t'))].join('\n');
   TXT.length = 0; TXT.push(tsv);
   openModal(`<h3>${title}</h3><div class="note">${prev ? 'Расход — с инвентаризации ' + new Date(prev.t*1000).toLocaleDateString('ru-RU') : 'Это первая инвентаризация — расход появится со следующей.'}</div>
     <button class="btn sec" data-act="copy" data-i="0">Копировать таблицу (для Excel / Google Таблиц)</button>
@@ -518,8 +561,8 @@ ACT.inv = b => {
 VIEWS.items = () => {
   let html = `<div class="btns"><button class="btn" data-act="edit">+ Позиция</button><button class="btn sec" data-act="bulk">Списком</button></div>`;
   if (!S.items.length) html += `<div class="card"><div class="empty">Список пуст</div><button class="btn sec" data-act="sample">Загрузить пример</button></div>`;
-  for (const [c, items] of byCat(S.items)) {
-    html += `<div class="card"><h3>${CATS[c].n} · ${items.length}</h3>${items.map(it => `<div class="row" data-act="edit" data-id="${it.id}"><div class="ri"><div class="nm">${esc(it.n)}</div><div class="sub">${esc(it.u)}${isNum(it.par) ? ' · норма ' + fmt(it.par) : ' · норма не задана'}${isNum(it.min) ? ' · мин ' + fmt(it.min) : ''}${it.sup ? ' · ' + esc(it.sup) : ''}${it.lh > 0 ? ' · хранится ' + fmtLife(it.lh) : ''}${hasRec(it) ? ' · ТТК' : ''}</div></div><span class="sub">›</span></div>`).join('')}</div>`;
+  for (const [g, items] of bySec(S.items)) {
+    html += `<div class="card"><h3>${esc(g)} · ${items.length}</h3>${items.map(it => `<div class="row" data-act="edit" data-id="${it.id}"><div class="ri"><div class="nm">${esc(it.n)}</div><div class="sub">${esc(it.u)}${isNum(it.par) ? ' · норма ' + fmt(it.par) : ' · норма не задана'}${isNum(it.min) ? ' · мин ' + fmt(it.min) : ''}${it.sup ? ' · ' + esc(it.sup) : ''}${it.lh > 0 ? ' · хранится ' + fmtLife(it.lh) : ''}${it.step > 0 ? ` · 1 ✅ = ${fmt(it.step)} ${esc(it.u)}` : ''}${hasRec(it) ? ' · ТТК' : ''}</div></div><span class="sub">›</span></div>`).join('')}</div>`;
   }
   html += `<button class="btn sec" data-act="backup">Резервная копия / перенос</button>`;
   return html;
@@ -533,6 +576,8 @@ ACT.edit = b => {
     <label>Название<input id="f_n" value="${esc(it.n)}" autocomplete="off"></label>
     <div class="two"><label>Категория<select id="f_c">${Object.entries(CATS).map(([k,c]) => `<option value="${k}" ${k === it.c ? 'selected' : ''}>${c.n}</option>`).join('')}</select></label>
       <label>Ед. изм.<input id="f_u" list="dl_u" value="${esc(it.u)}" autocomplete="off"></label></div>
+    <div class="two"><label>Раздел<input id="f_g" list="dl_g" value="${esc(it.g || '')}" autocomplete="off" placeholder="как категория"></label>
+      <label>1 ✅ = (шаг ±)<input id="f_step" inputmode="decimal" value="${v(it.step)}" placeholder="напр. 0,5"></label></div>
     <div class="two"><label>Норма (сколько держать)<input id="f_par" inputmode="decimal" value="${v(it.par)}"></label>
       <label>Минимум<input id="f_min" inputmode="decimal" value="${v(it.min)}" placeholder="не обяз."></label></div>
     <div class="note">Позиция попадёт в заказ, когда остаток ≤ минимума (или ниже нормы, если минимум пустой). Заказываем до нормы.</div>
@@ -541,11 +586,12 @@ ACT.edit = b => {
     <div class="two"><label>Срок хранения<input id="f_life" inputmode="decimal" value="${it.lh > 0 ? v(it.lh % 24 ? it.lh : it.lh/24) : ''}" placeholder="не следить"></label>
       <label>&nbsp;<select id="f_lu"><option value="24">суток</option><option value="1" ${it.lh > 0 && it.lh % 24 ? 'selected' : ''}>часов</option></select></label></div>
     <div class="note">Срок считается от даты, когда внёс «Приход» (приготовил). Самые старые партии уходят первыми.</div>
-    <label>ТТК на 1 ед. — по строке: Ингредиент; кол-во; ед.<textarea id="f_rec" placeholder="Водка царская Грейпфрут; 300; мл&#10;П/ф орже; 200; мл">${hasRec(it) ? esc(it.rec.ing.map(ingLine).join('\n')) : ''}</textarea></label>
+    <label>ТТК на одну партию — по строке: Ингредиент; кол-во; ед.<textarea id="f_rec" placeholder="Водка царская Грейпфрут; 300; мл&#10;П/ф орже; 200; мл">${hasRec(it) ? esc(it.rec.ing.map(ingLine).join('\n')) : ''}</textarea></label>
     <label>Выход ТТК, мл<input id="f_out" inputmode="decimal" value="${it.rec && isNum(it.rec.out) ? v(it.rec.out) : ''}" placeholder="не обяз."></label>
     ${hasRec(it) ? `<button class="btn sec" data-act="rec" data-id="${id}">Открыть ТТК с пересчётом</button>` : ''}
     <datalist id="dl_u">${UNITS.map(u => `<option value="${u}">`).join('')}</datalist>
     <datalist id="dl_s">${sups.map(s => `<option value="${esc(s)}">`).join('')}</datalist>
+    <datalist id="dl_g">${[...new Set(S.items.map(i => i.g).filter(Boolean))].map(s => `<option value="${esc(s)}">`).join('')}</datalist>
     <button class="btn" data-act="saveitem" data-id="${id || ''}">Сохранить</button>
     <div class="btns">${id ? `<button class="btn danger" data-act="delitem" data-id="${id}">Удалить</button>` : ''}<button class="btn sec" data-act="close">Отмена</button></div>`);
   if (!id) setTimeout(() => $('#f_n').focus(), 50);
@@ -554,7 +600,7 @@ ACT.saveitem = b => {
   const n = $('#f_n').value.trim();
   if (!n) { toast('Впиши название'); return; }
   const vals = {};
-  for (const k of ['par','min','mult','life']) {
+  for (const k of ['par','min','mult','life','step']) {
     const x = num($('#f_'+k).value);
     if (Number.isNaN(x) || x < 0) { toast('Проверь числа'); return; }
     vals[k] = x;
@@ -564,10 +610,12 @@ ACT.saveitem = b => {
   const ing = $('#f_rec').value.split('\n').map(parseIng).filter(Boolean);
   const out = num($('#f_out').value);
   vals.rec = ing.length ? {out: out > 0 ? out : null, ing} : null;
-  const data = {n, c: $('#f_c').value, u: $('#f_u').value.trim() || 'шт', sup: $('#f_sup').value.trim(), ...vals};
+  const data = {n, c: $('#f_c').value, g: $('#f_g').value.trim(), u: $('#f_u').value.trim() || 'шт', sup: $('#f_sup').value.trim(), ...vals};
   const id = b.dataset.id ? +b.dataset.id : null;
-  if (id) Object.assign(S.items.find(i => i.id === id), data);
-  else S.items.push({id: S.seq++, ...data});
+  const it = id ? S.items.find(i => i.id === id) : {id: S.seq++};
+  const moved = !id || secOf(it) !== secOf(data);
+  Object.assign(it, data);
+  if (moved) placeItem(it);
   persist(['it']); closeModal(); render(); toast('Сохранено');
 };
 ACT.delitem = async b => {
@@ -577,52 +625,91 @@ ACT.delitem = async b => {
   persist(['it']); closeModal(); render();
 };
 ACT.bulk = () => openModal(`<h3>Добавить списком</h3>
-  <div class="note">Одна позиция на строку:<br><b>Название; категория; ед.; норма; минимум; поставщик</b><br>Категория: заготовки / премиксы / продукты / алкоголь. Срок хранения можно дописать в любое место после единицы: <b>3 сут</b> или <b>12 ч</b>. Можно вставить строки прямо из Excel или Google Таблиц.<br>Если позиция с таким названием уже есть — она обновится заполненными полями, дубля не будет.<br>ТТК: строка <b># Название</b>, под ней ингредиенты <b>Ингредиент; кол-во; ед.</b> и <b>Выход; 750</b>, в конце пустая строка.</div>
-  <textarea id="f_bulk" placeholder="Сок лайма; заготовки; л; 3&#10;Лайм; продукты; кг; 5; 2; Фрукты-опт&#10;Джин Beefeater 0,7; алкоголь; бут; 6; 2; Алкосклад"></textarea>
+  <div class="note">Одна позиция на строку:<br><b>Название; категория; ед.; норма; минимум; поставщик</b><br>Категория: заготовки / премиксы / продукты / алкоголь. Срок хранения можно дописать в любое место после единицы: <b>3 сут</b> или <b>12 ч</b>. Можно вставить строки прямо из Excel или Google Таблиц.<br>Если позиция с таким названием уже есть — она обновится заполненными полями, дубля не будет.<br>Текущий остаток: <b>есть 0,5</b>, шаг кнопок ±: <b>галочка 0,5</b> — в любом месте после единицы.<br>Раздел: строка <b>[Сувид и инфьюзы]</b> — позиции ниже попадут в него, в том же порядке.<br>ТТК: строка <b># Название</b>, под ней ингредиенты <b>Ингредиент; кол-во; ед.</b> и <b>Выход; 750</b>, в конце пустая строка.</div>
+  <textarea id="f_bulk" placeholder="[Сувид и инфьюзы]&#10;Джин на лемонграссе; заготовки; л; 30 сут; есть 1&#10;Лайм; продукты; кг; 5; 2; Фрукты-опт"></textarea>
+  <label style="display:flex;gap:8px;align-items:center;color:var(--tx)"><input type="checkbox" id="f_repl" style="width:auto"> Заменить весь список: позиции, которых нет во вставке, удалятся</label>
   <button class="btn" data-act="bulksave">Добавить</button><button class="btn sec" data-act="close">Отмена</button>`);
-ACT.bulksave = () => {
+ACT.bulksave = async () => {
   const cat = s => { s = (s || '').trim().toLowerCase(); return s.startsWith('прем') ? 'premix' : s.startsWith('прод') ? 'prod' : s.startsWith('алк') ? 'alc' : 'prep'; };
   const nn = s => { const x = num(s); return x === null || Number.isNaN(x) ? null : x; };
   const LIFE = /^(\d+(?:[.,]\d+)?)\s*(ч|час|сут|д|дн)/i;
-  let added = 0, updated = 0, recs = 0, cur = null;
-  for (const line of $('#f_bulk').value.split('\n')) {
+  const STOCK = /^(?:есть|остаток)\s*(\d+(?:[.,]\d+)?)$/i;
+  const STEP = /^(?:галочка|✅)\s*=?\s*(\d+(?:[.,]\d+)?)/i;
+  const replace = $('#f_repl').checked;
+  const items = [...S.items]; // работаем с копией, чтобы «Отмена» в подтверждении ничего не меняла
+  const find = n => items.find(i => i.n.toLowerCase() === n.toLowerCase());
+  const seen = new Set(), counts = [];
+  let added = 0, updated = 0, recs = 0, cur = null, sec = null, seq = S.seq;
+  const lines = $('#f_bulk').value.split('\n');
+  const recsData = new Map();
+  for (const line of lines) {
+    const tl = line.trim();
+    // Раздел: «[Название]» — следующие позиции попадут в него
+    if (/^\[.+\]$/.test(tl)) { sec = tl.slice(1, -1).trim(); cur = null; continue; }
     // Блок ТТК: «# Название позиции», затем «Ингредиент; кол-во; ед.» и «Выход; 750» — до пустой строки
-    if (line.trim().startsWith('#')) {
-      const n = line.trim().slice(1).trim();
+    if (tl.startsWith('#')) {
+      const n = tl.slice(1).trim();
       if (!n) continue;
-      cur = S.items.find(i => i.n.toLowerCase() === n.toLowerCase());
-      if (!cur) { cur = {id: S.seq++, n, c: 'premix', u: 'бут', par: null, min: null, sup: '', mult: null, lh: null}; S.items.push(cur); added++; }
-      cur.rec = {out: null, ing: []};
+      cur = find(n);
+      if (!cur) { cur = {id: seq++, n, c: 'premix', g: sec || '', u: 'бут', par: null, min: null, sup: '', mult: null, lh: null}; items.push(cur); added++; }
+      seen.add(cur);
+      recsData.set(cur, {out: null, ing: []});
       recs++;
       continue;
     }
-    if (!line.trim()) { cur = null; continue; }
+    if (!tl) { cur = null; continue; }
     if (cur) {
       const m = line.match(/^\s*выход\D*(\d+(?:[.,]\d+)?)/i);
-      if (m) cur.rec.out = num(m[1]);
-      else { const ing = parseIng(line); if (ing) cur.rec.ing.push(ing); }
+      const r = recsData.get(cur);
+      if (m) r.out = num(m[1]);
+      else { const ing = parseIng(line); if (ing) r.ing.push(ing); }
       continue;
     }
     let p = line.split(/\t|;/).map(s => s.trim());
     if (!p[0]) continue;
-    let lh = null;
+    let lh = null, st = null, step = null;
     p = p.filter((s, i) => {
-      const m = i > 2 && s.match(LIFE);
+      if (i <= 2) return true;
+      const m = s.match(LIFE), k = s.match(STOCK), g = s.match(STEP);
       if (m) lh = num(m[1]) * (m[2].toLowerCase().startsWith('ч') ? 1 : 24);
-      return !m;
+      if (k) st = num(k[1]);
+      if (g) step = num(g[1]);
+      return !m && !k && !g;
     });
-    const data = {n: p[0], c: cat(p[1]), u: p[2] || 'шт', par: nn(p[3]), min: nn(p[4]), sup: p[5] || '', mult: nn(p[6]), lh};
-    const ex = S.items.find(i => i.n.toLowerCase() === data.n.toLowerCase());
-    if (ex) {
-      if (p[1]) ex.c = data.c;
-      if (p[2]) ex.u = data.u;
-      for (const k of ['par','min','mult','lh']) if (data[k] != null) ex[k] = data[k];
-      if (data.sup) ex.sup = data.sup;
+    const data = {n: p[0], c: cat(p[1]), u: p[2] || 'шт', par: nn(p[3]), min: nn(p[4]), sup: p[5] || '', mult: nn(p[6]), lh, step};
+    let it = find(data.n);
+    if (it) {
+      if (seen.has(it)) continue;
+      it = {...it}; items[items.findIndex(i => i.id === it.id)] = it;
+      if (p[1]) it.c = data.c;
+      if (p[2]) it.u = data.u;
+      for (const k of ['par','min','mult','lh','step']) if (data[k] != null) it[k] = data[k];
+      if (data.sup) it.sup = data.sup;
       updated++;
-    } else { S.items.push({id: S.seq++, ...data}); added++; }
+    } else { it = {id: seq++, ...data}; items.push(it); added++; }
+    if (sec !== null) it.g = sec;
+    seen.add(it);
+    if (st != null) counts.push([it.id, st]);
   }
   if (!added && !updated && !recs) { toast('Пусто'); return; }
-  persist(['it']); closeModal(); render(); toast(`Добавлено: ${added}` + (updated ? `, обновлено: ${updated}` : '') + (recs ? `, ТТК: ${recs}` : ''));
+  const removed = replace ? items.filter(i => !seen.has(i)) : [];
+  if (removed.length && !await ask(`Удалить ${removed.length} поз., которых нет во вставке?`)) return;
+  for (const [it, r] of recsData) it.rec = r;
+  if (replace) S.items = [...seen];
+  else {
+    // новые и перенесённые в другой раздел позиции — в конец своего раздела
+    S.items = items.filter(i => S.items.some(o => o.id === i.id && secOf(o) === secOf(i)));
+    for (const it of items) if (!S.items.includes(it)) placeItem(it);
+  }
+  S.seq = seq;
+  const names = ['it'];
+  if (counts.length) {
+    const t = now(), m = monthOf(t);
+    (S.ev[m] || (S.ev[m] = [])).push(...counts.map(([id, q]) => [t, id, 'c', q]));
+    rebuild(); names.push('e'+m, 'mo');
+  }
+  persist(names); closeModal(); render();
+  toast(`Добавлено: ${added}` + (updated ? `, обновлено: ${updated}` : '') + (recs ? `, ТТК: ${recs}` : '') + (removed.length ? `, удалено: ${removed.length}` : '') + (counts.length ? `, остатков: ${counts.length}` : ''));
 };
 ACT.sample = () => {
   if (S.items.length) return;
