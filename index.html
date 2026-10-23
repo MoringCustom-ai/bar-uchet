@@ -93,6 +93,7 @@ label input,label select{margin-top:4px}
   <button data-tab="plan"><b>📅</b>План</button>
   <button data-tab="stats"><b>📊</b>Расход</button>
   <button data-tab="items"><b>☰</b>Позиции</button>
+  <button data-tab="add"><b>＋</b>Добавить</button>
 </nav>
 <div id="modal"><div class="sheet" id="sheet"></div></div>
 <div id="toast"></div>
@@ -108,7 +109,7 @@ const CATS = {
   prod:   {n:'Продукты',  own:false},
   alc:    {n:'Алкоголь',  own:false},
 };
-const UNITS = ['л','мл','кг','г','шт','бут','уп','порц'];
+const UNITS = ['л','кг']; // остатки считаем только в литрах и килограммах (в ТТК ингредиенты — в мл, г, шт как угодно)
 
 // Состояние. События: [t (сек), id позиции, 'c' пересчёт | 'r' приход, кол-во], разложены по месяцам.
 let S = {items:[], seq:1, invs:[], ev:{}, cfg:{}};
@@ -392,8 +393,8 @@ function inputList(){
       ${st ? `<div class="stepper"><button class="pm" data-act="bump" data-id="${it.id}" data-dir="-1" aria-label="Минус">−</button>${inp}<button class="pm" data-act="bump" data-id="${it.id}" data-dir="1" aria-label="Плюс">+</button></div>` : inp}</div>`;
   }).join('')}</div>`).join('');
 }
-// Шаг кнопок ±: «галочка» позиции, для штучного — 1, для остального ± нет (только ввод числом)
-const stepOf = it => it.step > 0 ? it.step : ['шт','бут','уп','порц','кор'].includes(it.u) ? 1 : 0;
+// Шаг кнопок ±: «галочка» позиции; без галочки ± нет — только ввод числом
+const stepOf = it => it.step > 0 ? it.step : 0;
 // В «Остатках» ± сохраняются сразу: − «ушла галочка» (новый остаток), + «приготовил галочку» (приход).
 // Нажатия по одной позиции в течение 2 минут склеиваются в одну запись, обратная кнопка исправляет ошибку, а не пишет новое событие.
 const TAP_MERGE = 120;
@@ -540,16 +541,17 @@ function recBody(){
   const it = S.items.find(i => i.id === recId), k = recK();
   if (!it || !k) return '<div class="empty">Впиши количество</div>';
   const f = recF(it, k);
-  return `<table><tr><th>Ингредиент</th><th>на ${fmt(k)} ${esc(it.u)}</th></tr>${it.rec.ing.map(([n, qn, u]) => `<tr><td>${esc(n)}</td><td><b>${qn == null ? '' : fmtQ(qn*f)}</b> ${esc(u)}</td></tr>`).join('')}</table>
+  return `<table><tr><th>Ингредиент</th><th>на ${fmt(k)} ${byVol(it) ? esc(it.u) : 'парт.'}</th></tr>${it.rec.ing.map(([n, qn, u]) => `<tr><td>${esc(n)}</td><td><b>${qn == null ? '' : fmtQ(qn*f)}</b> ${esc(u)}</td></tr>`).join('')}</table>
     ${it.rec.out ? `<div class="note">Выход: ${fmtQ(it.rec.out*f)} мл</div>` : ''}`;
 }
 ACT.rec = b => {
   const it = S.items.find(i => i.id === +b.dataset.id);
   if (!it || !hasRec(it)) return;
   recId = it.id;
-  const k = +b.dataset.k > 0 ? +b.dataset.k : byVol(it) ? it.rec.out / VOL[it.u] : 1;
-  openModal(`<h3>${esc(it.n)}</h3><div class="note">${byVol(it) ? `ТТК на ${fmt(it.rec.out)} мл` : `ТТК на 1 ${esc(it.u)}${it.rec.out ? ` · выход ${fmt(it.rec.out)} мл` : ''}`}</div>
-    <div class="row"><div class="ri nm">Сколько сделать, ${esc(it.u)}</div><input id="f_k" class="num" inputmode="decimal" value="${String(k).replace('.', ',')}" autocomplete="off"></div>
+  // без выхода в ТТК литры в партии не перевести — считаем партиями
+  const k = !byVol(it) ? 1 : +b.dataset.k > 0 ? +b.dataset.k : it.rec.out / VOL[it.u];
+  openModal(`<h3>${esc(it.n)}</h3><div class="note">${byVol(it) ? `ТТК на ${fmt(it.rec.out)} мл` : `ТТК на 1 партию${it.rec.out ? ` · выход ${fmt(it.rec.out)} мл` : ' · выход не указан'}`}</div>
+    <div class="row"><div class="ri nm">Сколько сделать, ${byVol(it) ? esc(it.u) : 'партий'}</div><input id="f_k" class="num" inputmode="decimal" value="${String(k).replace('.', ',')}" autocomplete="off"></div>
     <div class="chips">${[0.5, 1, 1.5, 2, 3].map(v => `<button class="chip" data-act="reck" data-v="${v}">${fmt(v)}</button>`).join('')}</div>
     <div id="recbody"></div>
     <button class="btn sec" data-act="reccopy">Копировать</button>
@@ -561,7 +563,7 @@ ACT.reccopy = () => {
   const it = S.items.find(i => i.id === recId), k = recK();
   if (!it || !k) return;
   const f = recF(it, k);
-  copyText(`${it.n} — ${fmt(k)} ${it.u}:\n` + it.rec.ing.map(([n, qn, u]) => `— ${n}: ${qn == null ? '' : fmtQ(qn*f)} ${u}`.trimEnd()).join('\n') + (it.rec.out ? `\nВыход: ${fmtQ(it.rec.out*f)} мл` : ''));
+  copyText(`${it.n} — ${fmt(k)} ${byVol(it) ? it.u : 'парт.'}:\n` + it.rec.ing.map(([n, qn, u]) => `— ${n}: ${qn == null ? '' : fmtQ(qn*f)} ${u}`.trimEnd()).join('\n') + (it.rec.out ? `\nВыход: ${fmtQ(it.rec.out*f)} мл` : ''));
 };
 ACT.share = b => TG.openTelegramLink('https://t.me/share/url?url=' + encodeURIComponent(TXT[b.dataset.i]));
 
@@ -747,7 +749,7 @@ ACT.applynorms = async () => {
 };
 
 VIEWS.items = () => {
-  let html = `<div class="btns"><button class="btn" data-act="edit">+ Позиция</button><button class="btn sec" data-act="bulk">Списком</button></div>`;
+  let html = `<div class="btns"><button class="btn" data-act="gotab" data-v="add">+ Позиция</button><button class="btn sec" data-act="bulk">Списком</button></div>`;
   if (!S.items.length) html += `<div class="card"><div class="empty">Список пуст</div><button class="btn sec" data-act="sample">Загрузить пример</button></div>`;
   for (const [g, items] of bySec(S.items)) {
     html += `<div class="card"><h3>${esc(g)} · ${items.length}</h3>${items.map(it => `<div class="row" data-act="edit" data-id="${it.id}"><div class="ri"><div class="nm">${esc(it.n)}</div><div class="sub">${esc(it.u)}${isNum(it.par) ? ' · норма ' + fmt(it.par) : ' · норма не задана'}${isNum(it.min) ? ' · мин ' + fmt(it.min) : ''}${it.sup ? ' · ' + esc(it.sup) : ''}${it.lh > 0 ? ' · маркировка ' + fmtLife(it.lh) : ''}${it.step > 0 ? ` · 1 ✅ = ${fmt(it.step)} ${esc(it.u)}` : ''}${hasRec(it) ? ' · ТТК' : ''}</div></div><span class="sub">›</span></div>`).join('')}</div>`;
@@ -755,15 +757,14 @@ VIEWS.items = () => {
   html += `<button class="btn sec" data-act="backup">Резервная копия / перенос</button>`;
   return html;
 };
-ACT.edit = b => {
-  const id = b.dataset.id ? +b.dataset.id : null;
-  const it = id ? S.items.find(i => i.id === id) : {n:'', c: catF !== 'all' ? catF : 'prep', u:'л', par:null, min:null, sup:'', mult:null};
+// Поля карточки позиции — общие для «Позиции → изменить» и вкладки «Добавить»
+function itemForm(it, id){
   const sups = [...new Set(S.items.map(i => i.sup).filter(Boolean))];
   const v = x => isNum(x) ? String(x).replace('.', ',') : '';
-  openModal(`<h3>${id ? 'Позиция' : 'Новая позиция'}</h3>
-    <label>Название<input id="f_n" value="${esc(it.n)}" autocomplete="off"></label>
+  const units = UNITS.includes(it.u) ? UNITS : [...UNITS, it.u];
+  return `<label>Название<input id="f_n" value="${esc(it.n)}" autocomplete="off"></label>
     <div class="two"><label>Категория<select id="f_c">${Object.entries(CATS).map(([k,c]) => `<option value="${k}" ${k === it.c ? 'selected' : ''}>${c.n}</option>`).join('')}</select></label>
-      <label>Ед. изм.<input id="f_u" list="dl_u" value="${esc(it.u)}" autocomplete="off"></label></div>
+      <label>Ед. изм.<select id="f_u">${units.map(u => `<option ${u === it.u ? 'selected' : ''}>${esc(u)}</option>`).join('')}</select></label></div>
     <div class="two"><label>Раздел<input id="f_g" list="dl_g" value="${esc(it.g || '')}" autocomplete="off" placeholder="как категория"></label>
       <label>1 ✅ = (шаг ±)<input id="f_step" inputmode="decimal" value="${v(it.step)}" placeholder="напр. 0,5"></label></div>
     <div class="two"><label>Норма (сколько держать)<input id="f_par" inputmode="decimal" value="${v(it.par)}"></label>
@@ -776,14 +777,44 @@ ACT.edit = b => {
     <div class="note">Через сколько менять маркировку. Отсчёт — с момента, когда остаток вырос (приготовил), или от последней перемаркировки.</div>
     <label>ТТК на одну партию — по строке: Ингредиент; кол-во; ед.<textarea id="f_rec" placeholder="Водка царская Грейпфрут; 300; мл&#10;П/ф орже; 200; мл">${hasRec(it) ? esc(it.rec.ing.map(ingLine).join('\n')) : ''}</textarea></label>
     <label>Выход ТТК, мл<input id="f_out" inputmode="decimal" value="${it.rec && isNum(it.rec.out) ? v(it.rec.out) : ''}" placeholder="не обяз."></label>
-    ${hasRec(it) ? `<button class="btn sec" data-act="rec" data-id="${id}">Открыть ТТК с пересчётом</button>` : ''}
-    <datalist id="dl_u">${UNITS.map(u => `<option value="${u}">`).join('')}</datalist>
+    ${id && hasRec(it) ? `<button class="btn sec" data-act="rec" data-id="${id}">Открыть ТТК с пересчётом</button>` : ''}
     <datalist id="dl_s">${sups.map(s => `<option value="${esc(s)}">`).join('')}</datalist>
-    <datalist id="dl_g">${[...new Set(S.items.map(i => i.g).filter(Boolean))].map(s => `<option value="${esc(s)}">`).join('')}</datalist>
+    <datalist id="dl_g">${[...new Set(S.items.map(i => i.g).filter(Boolean))].map(s => `<option value="${esc(s)}">`).join('')}</datalist>`;
+}
+ACT.edit = b => {
+  const id = b.dataset.id ? +b.dataset.id : null;
+  const it = id ? S.items.find(i => i.id === id) : {n:'', c: catF !== 'all' ? catF : 'prep', u:'л', par:null, min:null, sup:'', mult:null};
+  openModal(`<h3>${id ? 'Позиция' : 'Новая позиция'}</h3>${itemForm(it, id)}
     <button class="btn" data-act="saveitem" data-id="${id || ''}">Сохранить</button>
     <div class="btns">${id ? `<button class="btn danger" data-act="delitem" data-id="${id}">Удалить</button>` : ''}<button class="btn sec" data-act="close">Отмена</button></div>`);
   if (!id) setTimeout(() => $('#f_n').focus(), 50);
 };
+
+// Вкладка «Добавить»: выбираешь тип — раздел, единица, маркировка и галочка подставляются сами
+const PRESETS = [
+  {k:'inf',   n:'Настой (сувид)',    c:'prep',   g:'Сувид и инфьюзы',    u:'л',  lh:720},
+  {k:'sva',   n:'Сувид б/а',         c:'prep',   g:'Сувид б/а',          u:'л',  lh:72},
+  {k:'blend', n:'Бленд',             c:'prep',   g:'Бленд',              u:'л',  lh:72},
+  {k:'foam',  n:'Пена',              c:'prep',   g:'Бленд',              u:'л',  lh:72, step:0.4},
+  {k:'cord',  n:'Кордиал / варка',   c:'prep',   g:'Варка',              u:'л',  lh:72},
+  {k:'pxa',   n:'Премикс б/а',       c:'premix', g:'Премиксы б/а',       u:'л',  lh:72, step:0.5},
+  {k:'px',    n:'Премикс',           c:'premix', g:'Премиксы',           u:'л',  lh:72, step:0.5},
+  {k:'bug',   n:'Бугельный премикс', c:'premix', g:'Бугельные премиксы', u:'л',  lh:72},
+  {k:'fresh', n:'Фреш / гарниш',     c:'prep',   g:'Фреши и гарниши',    u:'л',  lh:12, step:0.5},
+  {k:'prod',  n:'Продукт',           c:'prod',   g:'',                   u:'кг'},
+  {k:'alc',   n:'Алкоголь',          c:'alc',    g:'',                   u:'л'},
+];
+let addK = 'inf';
+VIEWS.add = () => {
+  const p = PRESETS.find(x => x.k === addK);
+  const it = {n:'', c:p.c, g:p.g, u:p.u, lh:p.lh || null, step:p.step || null, par:null, min:null, sup:'', mult:null};
+  return `<div class="card"><h3>Что добавляем</h3>
+      <div class="chips" style="flex-wrap:wrap;padding-bottom:10px">${PRESETS.map(x => `<button class="chip ${x.k === addK ? 'on' : ''}" data-act="addk" data-v="${x.k}">${x.n}</button>`).join('')}</div></div>
+    <div class="card" style="padding-bottom:12px">${itemForm(it, null)}
+      <div class="note">Бугельный премикс: в «1 ✅» впиши объём бугеля, например 0,75.</div>
+      <button class="btn" data-act="saveitem" data-id="">Добавить</button></div>`;
+};
+ACT.addk = b => { addK = b.dataset.v; render(); };
 ACT.saveitem = b => {
   const n = $('#f_n').value.trim();
   if (!n) { toast('Впиши название'); return; }
@@ -798,13 +829,16 @@ ACT.saveitem = b => {
   const ing = $('#f_rec').value.split('\n').map(parseIng).filter(Boolean);
   const out = num($('#f_out').value);
   vals.rec = ing.length ? {out: out > 0 ? out : null, ing} : null;
-  const data = {n, c: $('#f_c').value, g: $('#f_g').value.trim(), u: $('#f_u').value.trim() || 'шт', sup: $('#f_sup').value.trim(), ...vals};
+  const data = {n, c: $('#f_c').value, g: $('#f_g').value.trim(), u: $('#f_u').value || 'л', sup: $('#f_sup').value.trim(), ...vals};
+  if (!b.dataset.id && S.items.some(i => i.n.toLowerCase() === n.toLowerCase())) { toast('Такая позиция уже есть'); return; }
   const id = b.dataset.id ? +b.dataset.id : null;
   const it = id ? S.items.find(i => i.id === id) : {id: S.seq++};
   const moved = !id || secOf(it) !== secOf(data);
   Object.assign(it, data);
   if (moved) placeItem(it);
-  persist(['it']); closeModal(); render(); toast('Сохранено');
+  persist(['it']); closeModal(); render();
+  toast(id ? 'Сохранено' : `Добавлено: ${n} → ${secOf(it)}`);
+  if (!id) window.scrollTo(0, 0);
 };
 ACT.delitem = async b => {
   const id = +b.dataset.id;
@@ -881,7 +915,7 @@ ACT.bulksave = async () => {
       if (g) step = num(g[1]);
       return !m && !k && !g;
     });
-    const data = {n: p[0], c: cat(p[1]), u: p[2] || 'шт', par: nn(p[3]), min: nn(p[4]), sup: p[5] || '', mult: nn(p[6]), lh, step};
+    const data = {n: p[0], c: cat(p[1]), u: p[2] || 'л', par: nn(p[3]), min: nn(p[4]), sup: p[5] || '', mult: nn(p[6]), lh, step};
     let it = find(data.n);
     if (it) {
       if (seen.has(it)) continue;
