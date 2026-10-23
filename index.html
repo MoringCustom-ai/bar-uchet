@@ -116,7 +116,7 @@ let H = {};
 let tab = 'input', mode = 'c', catF = 'all', q = '', period = 7;
 const VIEWS = {}; // экраны
 const ACT = {};   // обработчики кнопок data-act
-const drafts = {c:{}, r:{}, inv:{}};
+const drafts = {c:{}, inv:{}};
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -361,12 +361,11 @@ VIEWS.input = () => {
     <button class="btn" data-act="gotab" data-v="items">Добавить позиции</button>
     <button class="btn sec" data-act="sample">Загрузить пример</button></div>`;
   const hint = {
-    c: 'Впиши, сколько сейчас есть. Можно складывать: 1,5+0,7. Пустые поля не сохраняются.',
-    r: 'Сколько пришло от поставщика или сколько приготовил. Прибавится к остатку, а время запомнится для маркировки.',
+    c: 'Кнопки сохраняются сразу: − ушла галочка, + приготовил галочку (с этого момента идёт маркировка). Ошибся — нажми обратную в течение 2 минут. Можно вписать число и нажать «Сохранить»: стало больше — разница запишется как приход.',
     inv: 'Полный пересчёт всего бара. Сохранится как инвентаризация с отчётом.',
   }[mode];
   return `<div class="seg">
-      ${[['c','Остатки'],['r','Приход'],['inv','Инвентаризация']].map(([k,n]) => `<button data-act="mode" data-v="${k}" class="${mode === k ? 'on' : ''}">${n}</button>`).join('')}
+      ${[['c','Остатки'],['inv','Инвентаризация']].map(([k,n]) => `<button data-act="mode" data-v="${k}" class="${mode === k ? 'on' : ''}">${n}</button>`).join('')}
     </div>
     <div class="chips">${[['all','Все'], ...Object.entries(CATS).map(([k,c]) => [k, c.n])].map(([k,n]) => `<button class="chip ${catF === k ? 'on' : ''}" data-act="cat" data-v="${k}">${n}</button>`).join('')}</div>
     <input class="search" id="q" placeholder="Поиск" value="${esc(q)}" autocomplete="off">
@@ -383,10 +382,10 @@ function inputList(){
     let sub = `сейчас ${s == null ? '—' : fmt(s) + ' ' + esc(it.u)}`;
     if (it.step > 0 && s != null) sub += ` (${fmt(Math.round(s/it.step*10)/10)} ✅)`;
     if (isNum(it.par)) sub += ` · норма ${fmt(it.par)}`;
-    if (lc && mode !== 'r') sub += ` · посч. ${fmtD(lc[0])}`;
+    if (lc) sub += ` · посч. ${fmtD(lc[0])}`;
     sub += shelfText(it, shelf(it));
     // в поле серым — текущий остаток; ± меняют его на одну «галочку»
-    const ph = mode === 'r' ? '+ ' + it.u : s == null ? it.u : fmt(s);
+    const ph = s == null ? it.u : fmt(s);
     const st = stepOf(it);
     const inp = `<input class="num ${d[it.id] ? 'filled' : ''}" data-id="${it.id}" inputmode="decimal" enterkeyhint="next" placeholder="${esc(ph)}" value="${esc(d[it.id] || '')}" autocomplete="off">`;
     return `<div class="row ${needs(it, s) ? 'low' : ''}"><div class="ri"><div class="nm">${esc(it.n)}</div><div class="sub">${sub}${hasRec(it) ? ` · <button class="mini" data-act="rec" data-id="${it.id}">ТТК</button>` : ''}</div></div>
@@ -395,14 +394,50 @@ function inputList(){
 }
 // Шаг кнопок ±: «галочка» позиции, для штучного — 1, для остального ± нет (только ввод числом)
 const stepOf = it => it.step > 0 ? it.step : ['шт','бут','уп','порц','кор'].includes(it.u) ? 1 : 0;
+// В «Остатках» ± сохраняются сразу: − «ушла галочка» (новый остаток), + «приготовил галочку» (приход).
+// Нажатия по одной позиции в течение 2 минут склеиваются в одну запись, обратная кнопка исправляет ошибку, а не пишет новое событие.
+const TAP_MERGE = 120;
+const lastTap = {}; // id -> {t, kind, ev, base}
+let tapTimer = null, tapNames = new Set();
+function persistSoon(names){
+  names.forEach(n => tapNames.add(n));
+  clearTimeout(tapTimer);
+  tapTimer = setTimeout(() => { persist([...tapNames]); tapNames = new Set(); }, 800);
+}
+function tap(it, dir, st){
+  const id = it.id, t = now(), m = monthOf(t), r3 = x => Math.round(x*1000)/1000;
+  const s = stockAt(id) ?? 0;
+  const lt = lastTap[id];
+  const live = lt && t - lt.t < TAP_MERGE && Object.values(S.ev).some(a => a.includes(lt.ev));
+  const drop = e => { for (const k in S.ev) { const i = S.ev[k].indexOf(e); if (i >= 0) S.ev[k].splice(i, 1); } delete lastTap[id]; };
+  const push = (kind, q, base) => { const e = [t, id, kind, q]; (S.ev[m] || (S.ev[m] = [])).push(e); lastTap[id] = {t, kind, ev: e, base}; };
+  if (dir < 0) {
+    if (live && lt.kind === 'r') { lt.ev[3] = r3(lt.ev[3] - st); lt.t = t; if (lt.ev[3] <= 1e-9) drop(lt.ev); }
+    else if (s <= 1e-9) return false;
+    else if (live && lt.kind === 'c') { lt.ev[3] = r3(Math.max(0, lt.ev[3] - st)); lt.t = t; }
+    else push('c', r3(Math.max(0, s - st)), s);
+  } else {
+    if (live && lt.kind === 'c') { lt.ev[3] = r3(lt.ev[3] + st); lt.t = t; if (lt.ev[3] >= lt.base - 1e-9) drop(lt.ev); }
+    else if (live && lt.kind === 'r') { lt.ev[3] = r3(lt.ev[3] + st); lt.t = t; }
+    else push('r', st);
+  }
+  rebuild(); persistSoon(['e'+m, 'mo']);
+  return true;
+}
 ACT.bump = b => {
   const id = b.dataset.id, it = S.items.find(i => i.id === +id), st = stepOf(it);
   if (!st) return;
+  if (mode === 'c') {
+    delete drafts.c[id];
+    if (tap(it, +b.dataset.dir, st)) { try { TG.HapticFeedback.selectionChanged(); } catch(e) {} }
+    $('#list').innerHTML = inputList(); updateSaveBar();
+    return;
+  }
   const d = drafts[mode];
   let base = num(d[id]);
-  if (base == null || Number.isNaN(base)) base = mode === 'r' ? 0 : (stockAt(it.id) ?? 0);
+  if (base == null || Number.isNaN(base)) base = stockAt(it.id) ?? 0;
   const v = Math.max(0, Math.round((base + +b.dataset.dir * st)*1000)/1000);
-  if (mode === 'r' && v === 0) delete d[id]; else d[id] = String(v).replace('.', ',');
+  d[id] = String(v).replace('.', ',');
   const el = document.querySelector(`#list .num[data-id="${id}"]`);
   if (el) { el.value = d[id] || ''; el.classList.toggle('filled', !!d[id]); }
   try { TG.HapticFeedback.selectionChanged(); } catch(e) {}
@@ -412,7 +447,7 @@ function updateSaveBar(){
   const bar = $('#savebar');
   if (tab !== 'input' || !S.items.length) { bar.innerHTML = ''; return; }
   const n = Object.values(drafts[mode]).filter(v => String(v).trim() !== '').length;
-  const label = {c:'Сохранить остатки', r:'Сохранить приход', inv:`Сохранить инвентаризацию · ${n} из ${S.items.length}`}[mode];
+  const label = {c:'Сохранить остатки', inv:`Сохранить инвентаризацию · ${n} из ${S.items.length}`}[mode];
   bar.innerHTML = `<button class="btn" data-act="save" ${n ? '' : 'disabled'}>${label}${mode !== 'inv' && n ? ` (${n})` : ''}</button>`;
 }
 ACT.mode = b => { mode = b.dataset.v; if (mode === 'inv') catF = 'all'; render(); };
@@ -420,17 +455,22 @@ ACT.cat = b => { catF = b.dataset.v; render(); };
 ACT.gotab = b => { tab = b.dataset.v; render(); };
 ACT.save = async () => {
   const d = drafts[mode], t = now(), m = monthOf(t), add = [];
+  let counted = 0, made = 0;
   for (const id in d) {
     const v = num(d[id]);
     if (v === null) continue;
     const it = S.items.find(i => i.id == id);
     if (!it) continue;
     if (isNaN(v) || v < 0) { toast(`Проверь число: «${it.n}»`); return; }
-    add.push([t, +id, mode === 'r' ? 'r' : 'c', v]);
+    // стало больше, чем было — приготовил или пришла поставка: разницу пишем приходом (с неё же начинается маркировка)
+    const s = stockAt(it.id);
+    if (s != null && v > s + 1e-9) { add.push([t, +id, 'r', Math.round((v - s)*1000)/1000]); made++; }
+    add.push([t, +id, 'c', v]);
+    counted++;
   }
-  if (!add.length) return;
+  if (!counted) return;
   if (mode === 'inv') {
-    const missing = S.items.length - add.length;
+    const missing = S.items.length - counted;
     if (missing > 0 && !await ask(`Не заполнено ${missing} поз. Сохранить инвентаризацию без них?`)) return;
     S.invs.push({t});
   }
@@ -439,7 +479,7 @@ ACT.save = async () => {
   rebuild();
   persist(['e'+m, 'mo', ...(mode === 'inv' ? ['iv'] : [])]);
   haptic('success');
-  toast(mode === 'r' ? 'Приход записан' : mode === 'inv' ? 'Инвентаризация сохранена' : 'Остатки сохранены');
+  toast((mode === 'inv' ? 'Инвентаризация сохранена' : 'Остатки сохранены') + (made ? ` · приготовлено/пришло: ${made} поз.` : ''));
   render();
   window.scrollTo(0, 0);
 };
@@ -671,7 +711,7 @@ VIEWS.plan = () => {
   const dd = dataDays();
   const P = PLAN = buildPlan();
   let html = `<div class="card"><h3>Данные</h3><div class="row"><div class="ri"><div class="nm">${dd} из ${WINDOW} дней</div>
-    <div class="sub">${dd >= WINDOW ? 'План строится по последним 2 неделям и пересчитывается каждый раз' : `План предварительный — станет точным через ${WINDOW - dd} дн. Каждый день вноси остатки, а всё, что приготовил, — через «Приход».`}</div></div></div>
+    <div class="sub">${dd >= WINDOW ? 'План строится по последним 2 неделям и пересчитывается каждый раз' : `План предварительный — станет точным через ${WINDOW - dd} дн. Каждый день вноси остатки — и до того, как готовишь, и после.`}</div></div></div>
     <div style="height:6px;background:var(--bg2);border-radius:3px;margin:4px 0 12px"><div style="height:6px;width:${Math.round(dd/WINDOW*100)}%;background:var(--acc);border-radius:3px"></div></div></div>
     <div class="note">Заготовочный день (для настоев с маркировкой от недели):</div>
     <div class="chips" style="padding-top:4px">${[1,2,3,4,5,6,0].map(w => `<button class="chip ${prepWd() === w ? 'on' : ''}" data-act="prepwd" data-v="${w}">${WD[w]}</button>`).join('')}</div>`;
@@ -733,7 +773,7 @@ ACT.edit = b => {
     <label>Кратность заказа<input id="f_mult" inputmode="decimal" value="${v(it.mult)}" placeholder="напр. 6 — если коробками по 6"></label>
     <div class="two"><label>Маркировка каждые<input id="f_life" inputmode="decimal" value="${it.lh > 0 ? v(it.lh % 24 ? it.lh : it.lh/24) : ''}" placeholder="не следить"></label>
       <label>&nbsp;<select id="f_lu"><option value="24">суток</option><option value="1" ${it.lh > 0 && it.lh % 24 ? 'selected' : ''}>часов</option></select></label></div>
-    <div class="note">Через сколько менять маркировку. Отсчёт — от «Прихода» (приготовил) или от последней перемаркировки.</div>
+    <div class="note">Через сколько менять маркировку. Отсчёт — с момента, когда остаток вырос (приготовил), или от последней перемаркировки.</div>
     <label>ТТК на одну партию — по строке: Ингредиент; кол-во; ед.<textarea id="f_rec" placeholder="Водка царская Грейпфрут; 300; мл&#10;П/ф орже; 200; мл">${hasRec(it) ? esc(it.rec.ing.map(ingLine).join('\n')) : ''}</textarea></label>
     <label>Выход ТТК, мл<input id="f_out" inputmode="decimal" value="${it.rec && isNum(it.rec.out) ? v(it.rec.out) : ''}" placeholder="не обяз."></label>
     ${hasRec(it) ? `<button class="btn sec" data-act="rec" data-id="${id}">Открыть ТТК с пересчётом</button>` : ''}
