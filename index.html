@@ -350,7 +350,19 @@ ACT.relabel = b => {
   const next = bySchedule(it) ? relabelDayFor(t, t + it.lh*3600) : null;
   toast(`${it.n}: ` + (next != null ? `следующая перемаркировка ${fmtDay(next)}` : `новая маркировка до ${fmtExp(it, t + it.lh*3600)}`));
   render();
+  const el = $('#reclabel'); // открыто окно ТТК этой позиции — обновить строку маркировки
+  if (el && recId === it.id) el.innerHTML = recLabelHtml(it);
 };
+// Строка маркировки в окне ТТК: когда переклеивать и кнопка подтверждения (нажать можно в любой момент)
+function recLabelHtml(it){
+  if (!(it.lh > 0)) return '';
+  const sh = shelf(it);
+  let txt;
+  if (!sh) txt = '<span class="sub">дата неизвестна — нажми, когда переклеишь, и отсчёт начнётся</span>';
+  else if (sh.st === 'bad') txt = `<span class="bad">${sh.due === dayStart(now()) ? 'перемаркировать сегодня' : 'пора перемаркировать'}</span>`;
+  else txt = `<span class="${sh.st === 'soon' ? 'soon' : 'sub'}">${sh.due != null ? 'перемаркировка ' + fmtDay(sh.due) : 'до ' + fmtExp(it, sh.exp)}</span>`;
+  return `<div class="row"><div class="ri"><div class="nm">Маркировка · каждые ${fmtLife(it.lh)}</div><div class="sub">${sh ? `стоит с ${fmtDT(sh.made)} · ` : ''}${txt}</div></div><button class="btn" style="width:auto;margin:0;padding:9px 12px" data-act="relabel" data-id="${it.id}">Перемаркировал</button></div>`;
+}
 ACT.relabelAll = () => {
   const t = now(), m = monthOf(t);
   const due = S.items.filter(it => { const sh = shelf(it); return sh && sh.st === 'bad'; });
@@ -693,6 +705,7 @@ ACT.rec = b => {
   // без выхода в ТТК литры в партии не перевести — считаем партиями
   const k = !byVol(it) ? 1 : +b.dataset.k > 0 ? +b.dataset.k : it.rec.out / VOL[it.u];
   openModal(`<h3>${esc(it.n)}</h3><div class="note">${byVol(it) ? `ТТК на ${fmt(it.rec.out)} мл` : `ТТК на 1 партию${it.rec.out ? ` · выход ${fmt(it.rec.out)} мл` : ' · выход не указан'}`}</div>
+    <div id="reclabel">${recLabelHtml(it)}</div>
     <div class="row"><div class="ri nm">Сколько сделать, ${byVol(it) ? esc(it.u) : 'партий'}</div><input id="f_k" class="num" inputmode="decimal" value="${String(k).replace('.', ',')}" autocomplete="off"></div>
     <div class="chips">${[0.5, 1, 1.5, 2, 3].map(v => `<button class="chip" data-act="reck" data-v="${v}">${fmt(v)}</button>`).join('')}</div>
     <div id="recbody"></div>
@@ -883,7 +896,7 @@ VIEWS.plan = () => {
     lines.push(title + ':', ...d.make.map(m => `  ${m.extra ? 'доделать' : 'приготовить'} ${m.it.n} — ${qtyTxt(m.it, m.q)}`), ...d.relabel.map(x => `  перемаркировать ${x.it.n}${x.t ? ' — ' + fmtT(x.t) : ''}`));
     html += `<div class="card"><h3>${title}</h3>
       ${d.make.length ? d.make.map(m => `<div class="row" ${hasRec(m.it) ? `data-act="rec" data-id="${m.it.id}" data-k="${m.q}"` : ''}><div class="ri"><div class="nm">${esc(m.it.n)}</div><div class="sub">${m.extra ? 'доделать — не хватит до следующей смены' : 'приготовить'}</div></div><div class="val">${qtyTxt(m.it, m.q)}${hasRec(m.it) ? '<div class="mini">ТТК ›</div>' : ''}</div></div>`).join('') : ''}
-      ${d.relabel.length ? `<div class="sub" style="padding:8px 0 2px">Перемаркировать (${d.relabel.length}):</div>` + d.relabel.map(x => `<div class="row"><div class="ri"><div class="nm">${esc(x.it.n)}</div></div><div class="val soon">${x.t ? fmtT(x.t) : '✓'}</div></div>`).join('') : ''}</div>`;
+      ${d.relabel.length ? `<div class="sub" style="padding:8px 0 2px">Перемаркировать (${d.relabel.length}):</div>` + d.relabel.map(x => `<div class="row"><div class="ri"><div class="nm">${esc(x.it.n)}</div></div><div class="val soon">${d.t === P.days[0].t ? relabelBtn(x.it) : x.t ? fmtT(x.t) : ''}</div></div>`).join('') : ''}</div>`;
   }
   const ti = TXT.push('План на неделю\n' + lines.join('\n')) - 1;
   html += `<button class="btn sec" data-act="copy" data-i="${ti}">Копировать план</button>`;
