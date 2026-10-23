@@ -377,11 +377,14 @@ VIEWS.input = () => {
     <div class="note">${hint}</div>
     <div id="list">${inputList()}</div>`;
 };
+// Что видно барменам: заготовки и премиксы, кроме разделов, которые на бар не идут (настои, сувид б/а, варка).
+// Для отдельной позиции можно переопределить галочкой «Показывать в „Бар“» (it.bar)
+const BAR_HIDDEN = ['Сувид и инфьюзы', 'Сувид б/а', 'Варка'];
+const inBar = it => CATS[it.c].own && (typeof it.bar === 'boolean' ? it.bar : !BAR_HIDDEN.includes(it.g || ''));
 function inputList(){
   const d = drafts[mode];
   const ql = q.trim().toLowerCase();
-  // бармены берут только заготовки и премиксы
-  const list = S.items.filter(i => (mode !== 'bar' || CATS[i.c].own) && (catF === 'all' || i.c === catF) && (!ql || i.n.toLowerCase().includes(ql)));
+  const list = S.items.filter(i => (mode !== 'bar' || inBar(i)) && (catF === 'all' || i.c === catF) && (!ql || i.n.toLowerCase().includes(ql)));
   if (!list.length) return `<div class="card"><div class="empty">Ничего не найдено</div></div>`;
   return bySec(list).map(([g, items]) => `<div class="card"><h3>${esc(g)}</h3>${items.map(it => {
     const s = stockAt(it.id), lc = lastCount(it.id);
@@ -828,6 +831,7 @@ function itemForm(it, id){
       <label>Ед. изм.<select id="f_u">${units.map(u => `<option ${u === it.u ? 'selected' : ''}>${esc(u)}</option>`).join('')}</select></label></div>
     <div class="two"><label>Раздел<input id="f_g" list="dl_g" value="${esc(it.g || '')}" autocomplete="off" placeholder="как категория"></label>
       <label>1 ✅ = (шаг ±)<input id="f_step" inputmode="decimal" value="${v(it.step)}" placeholder="напр. 0,5"></label></div>
+    <label style="display:flex;gap:8px;align-items:center;color:var(--tx)"><input type="checkbox" id="f_bar" style="width:auto" ${inBar(it) ? 'checked' : ''}> Показывать во вкладке «Бар» (для заготовок и премиксов)</label>
     <div class="two"><label>Норма (сколько держать)<input id="f_par" inputmode="decimal" value="${v(it.par)}"></label>
       <label>Минимум<input id="f_min" inputmode="decimal" value="${v(it.min)}" placeholder="не обяз."></label></div>
     <div class="note">Позиция попадёт в заказ, когда остаток ≤ минимума (или ниже нормы, если минимум пустой). Заказываем до нормы.</div>
@@ -868,7 +872,7 @@ const PRESETS = [
 let addK = 'inf';
 VIEWS.add = () => {
   const p = PRESETS.find(x => x.k === addK);
-  const it = {n:'', c:p.c, g:p.g, u:p.u, lh:p.lh || null, step:p.step || null, par:null, min:null, sup:'', mult:null};
+  const it = {n:'', c:p.c, g:p.g, u:p.u, lh:p.lh || null, step:p.step || null, par:null, min:null, sup:'', mult:null}; // «в баре» — по разделу
   return `<div class="card"><h3>Что добавляем</h3>
       <div class="chips" style="flex-wrap:wrap;padding-bottom:10px">${PRESETS.map(x => `<button class="chip ${x.k === addK ? 'on' : ''}" data-act="addk" data-v="${x.k}">${x.n}</button>`).join('')}</div></div>
     <div class="card" style="padding-bottom:12px">${itemForm(it, null)}
@@ -890,7 +894,7 @@ ACT.saveitem = b => {
   const ing = $('#f_rec').value.split('\n').map(parseIng).filter(Boolean);
   const out = num($('#f_out').value);
   vals.rec = ing.length ? {out: out > 0 ? out : null, ing} : null;
-  const data = {n, c: $('#f_c').value, g: $('#f_g').value.trim(), u: $('#f_u').value || 'л', sup: $('#f_sup').value.trim(), ...vals};
+  const data = {n, c: $('#f_c').value, g: $('#f_g').value.trim(), u: $('#f_u').value || 'л', sup: $('#f_sup').value.trim(), bar: $('#f_bar').checked, ...vals};
   if (!b.dataset.id && S.items.some(i => i.n.toLowerCase() === n.toLowerCase())) { toast('Такая позиция уже есть'); return; }
   const id = b.dataset.id ? +b.dataset.id : null;
   const it = id ? S.items.find(i => i.id === id) : {id: S.seq++};
@@ -918,6 +922,7 @@ ACT.bulksave = async () => {
   const LIFE = /^(\d+(?:[.,]\d+)?)\s*(ч|час|сут|д|дн)/i;
   const STOCK = /^(?:есть|остаток)\s*(\d+(?:[.,]\d+)?)$/i;
   const STEP = /^(?:галочка|✅)\s*=?\s*(\d+(?:[.,]\d+)?)/i;
+  const BARTOK = /^(не )?в баре$/i;
   const replace = $('#f_repl').checked;
   const items = [...S.items]; // работаем с копией, чтобы «Отмена» в подтверждении ничего не меняла
   const find = n => items.find(i => i.n.toLowerCase() === n.toLowerCase());
@@ -967,23 +972,24 @@ ACT.bulksave = async () => {
     }
     let p = line.split(/\t|;/).map(s => s.trim());
     if (!p[0]) continue;
-    let lh = null, st = null, step = null;
+    let lh = null, st = null, step = null, bar = null;
     p = p.filter((s, i) => {
       if (i <= 2) return true;
-      const m = s.match(LIFE), k = s.match(STOCK), g = s.match(STEP);
+      const m = s.match(LIFE), k = s.match(STOCK), g = s.match(STEP), b = s.match(BARTOK);
       if (m) lh = num(m[1]) * (m[2].toLowerCase().startsWith('ч') ? 1 : 24);
       if (k) st = num(k[1]);
       if (g) step = num(g[1]);
-      return !m && !k && !g;
+      if (b) bar = !b[1];
+      return !m && !k && !g && !b;
     });
-    const data = {n: p[0], c: cat(p[1]), u: p[2] || 'л', par: nn(p[3]), min: nn(p[4]), sup: p[5] || '', mult: nn(p[6]), lh, step};
+    const data = {n: p[0], c: cat(p[1]), u: p[2] || 'л', par: nn(p[3]), min: nn(p[4]), sup: p[5] || '', mult: nn(p[6]), lh, step, bar};
     let it = find(data.n);
     if (it) {
       if (seen.has(it)) continue;
       it = {...it}; items[items.findIndex(i => i.id === it.id)] = it;
       if (p[1]) it.c = data.c;
       if (p[2]) it.u = data.u;
-      for (const k of ['par','min','mult','lh','step']) if (data[k] != null) it[k] = data[k];
+      for (const k of ['par','min','mult','lh','step','bar']) if (data[k] != null) it[k] = data[k];
       if (data.sup) it.sup = data.sup;
       updated++;
     } else { it = {id: seq++, ...data}; items.push(it); added++; }
