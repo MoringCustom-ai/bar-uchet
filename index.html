@@ -114,10 +114,12 @@ const UNITS = ['л','кг']; // остатки считаем только в л
 // Состояние. События: [t (сек), id позиции, 'c' пересчёт | 'r' приход, кол-во], разложены по месяцам.
 let S = {items:[], seq:1, invs:[], ev:{}, cfg:{}};
 let H = {};
-let tab = 'input', mode = 'c', catF = 'all', q = '', period = 7;
+// Режим ввода: 'bar' — бармены берут на коктейли, 'prep' — заготовщик готовит, 'inv' — инвентаризация. Запоминается на устройстве
+let tab = 'input', mode = 'prep', catF = 'all', q = '', period = 7;
+try { const m0 = localStorage.getItem('barinv:mode'); if (['bar','prep','inv'].includes(m0)) mode = m0; } catch(e) {}
 const VIEWS = {}; // экраны
 const ACT = {};   // обработчики кнопок data-act
-const drafts = {c:{}, inv:{}};
+const drafts = {bar:{}, prep:{}, inv:{}};
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -362,13 +364,15 @@ VIEWS.input = () => {
     <button class="btn" data-act="gotab" data-v="items">Добавить позиции</button>
     <button class="btn sec" data-act="sample">Загрузить пример</button></div>`;
   const hint = {
-    c: 'Кнопки сохраняются сразу: − ушла галочка, + приготовил галочку (с этого момента идёт маркировка). Ошибся — нажми обратную в течение 2 минут. Можно вписать число и нажать «Сохранить»: стало больше — разница запишется как приход.',
+    bar: 'Для барменов. «−» — взял галочку на коктейли, сохраняется сразу. «+» — только исправить свой ошибочный «−» (в течение 2 минут). Можно вписать, сколько осталось, и нажать «Сохранить».',
+    prep: 'Для заготовщика. «+» — приготовил галочку: сохраняется сразу, ингредиенты по ТТК списываются сами, с этого момента идёт маркировка. «−» — только исправить свой ошибочный «+» (в течение 2 минут). Число + «Сохранить»: стало больше — разница запишется как приготовленное.',
     inv: 'Полный пересчёт всего бара. Сохранится как инвентаризация с отчётом.',
   }[mode];
+  const cats = mode === 'bar' ? Object.entries(CATS).filter(([, c]) => c.own) : Object.entries(CATS);
   return `<div class="seg">
-      ${[['c','Остатки'],['inv','Инвентаризация']].map(([k,n]) => `<button data-act="mode" data-v="${k}" class="${mode === k ? 'on' : ''}">${n}</button>`).join('')}
+      ${[['bar','Бар'],['prep','Заготовка'],['inv','Инвентаризация']].map(([k,n]) => `<button data-act="mode" data-v="${k}" class="${mode === k ? 'on' : ''}">${n}</button>`).join('')}
     </div>
-    <div class="chips">${[['all','Все'], ...Object.entries(CATS).map(([k,c]) => [k, c.n])].map(([k,n]) => `<button class="chip ${catF === k ? 'on' : ''}" data-act="cat" data-v="${k}">${n}</button>`).join('')}</div>
+    <div class="chips">${[['all','Все'], ...cats.map(([k,c]) => [k, c.n])].map(([k,n]) => `<button class="chip ${catF === k ? 'on' : ''}" data-act="cat" data-v="${k}">${n}</button>`).join('')}</div>
     <input class="search" id="q" placeholder="Поиск" value="${esc(q)}" autocomplete="off">
     <div class="note">${hint}</div>
     <div id="list">${inputList()}</div>`;
@@ -376,7 +380,8 @@ VIEWS.input = () => {
 function inputList(){
   const d = drafts[mode];
   const ql = q.trim().toLowerCase();
-  const list = S.items.filter(i => (catF === 'all' || i.c === catF) && (!ql || i.n.toLowerCase().includes(ql)));
+  // бармены берут только заготовки и премиксы
+  const list = S.items.filter(i => (mode !== 'bar' || CATS[i.c].own) && (catF === 'all' || i.c === catF) && (!ql || i.n.toLowerCase().includes(ql)));
   if (!list.length) return `<div class="card"><div class="empty">Ничего не найдено</div></div>`;
   return bySec(list).map(([g, items]) => `<div class="card"><h3>${esc(g)}</h3>${items.map(it => {
     const s = stockAt(it.id), lc = lastCount(it.id);
@@ -405,32 +410,80 @@ function persistSoon(names){
   clearTimeout(tapTimer);
   tapTimer = setTimeout(() => { persist([...tapNames]); tapNames = new Set(); }, 800);
 }
-function tap(it, dir, st){
-  const id = it.id, t = now(), m = monthOf(t), r3 = x => Math.round(x*1000)/1000;
+const r3 = x => Math.round(x*1000)/1000;
+const dropEv = e => { for (const k in S.ev) { const i = S.ev[k].indexOf(e); if (i >= 0) S.ev[k].splice(i, 1); } };
+
+/* Автосписание по ТТК: приготовил позицию — ингредиенты, которые есть в списке позиций, уменьшаются сами */
+const normName = s => String(s).toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
+const ingItem = n => S.items.find(i => normName(i.n) === normName(n));
+const UNIT_K = {'мл': 0.001, 'г': 0.001, 'л': 1, 'кг': 1}; // мл и г считаем одинаково (плотность ≈ 1)
+// [{it, per}] — сколько ингредиента (в его единицах) уходит на 1 ед. готового; без выхода в ТТК не списываем
+function deductPlan(it){
+  if (!hasRec(it) || !byVol(it)) return [];
+  const batchPerUnit = VOL[it.u] / it.rec.out;
+  const out = [];
+  for (const [n, qn, u] of it.rec.ing) {
+    const k = UNIT_K[String(u || '').trim()], ing = ingItem(n);
+    if (qn == null || !k || !ing || ing === it) continue;
+    out.push({it: ing, per: qn * k * batchPerUnit});
+  }
+  return out;
+}
+// Записывает списание на q ед. готового в момент t; возвращает связанные записи, чтобы их можно было поправить
+function deduct(it, q, t){
+  const m = monthOf(t), deps = [];
+  for (const d of deductPlan(it)) {
+    const s = stockAt(d.it.id);
+    if (s == null) continue; // остаток ингредиента ещё ни разу не вносили — списывать не из чего
+    const e = [t, d.it.id, 'c', r3(Math.max(0, s - d.per*q)), it.id];
+    (S.ev[m] || (S.ev[m] = [])).push(e);
+    deps.push({ev: e, base: s, per: d.per});
+  }
+  return deps;
+}
+const syncDeps = (deps, q) => deps.forEach(d => d.ev[3] = r3(Math.max(0, d.base - d.per*q)));
+const depsText = (it, deps) => deps.length ? ` · списано: ${deps.map(d => `${S.items.find(i => i.id === d.ev[1]).n} ${fmt(r3(d.base - d.ev[3]))} ${S.items.find(i => i.id === d.ev[1]).u}`).join(', ')}` : '';
+
+// Бар: «−» — взял (расход), «+» — только отменить свой недавний «−».
+// Заготовка: «+» — приготовил (приход + списание по ТТК), «−» — только отменить свой недавний «+».
+function tap(it, dir, st, role){
+  const id = it.id, t = now(), m = monthOf(t), key = role + ':' + id;
   const s = stockAt(id) ?? 0;
-  const lt = lastTap[id];
+  const lt = lastTap[key];
   const live = lt && t - lt.t < TAP_MERGE && Object.values(S.ev).some(a => a.includes(lt.ev));
-  const drop = e => { for (const k in S.ev) { const i = S.ev[k].indexOf(e); if (i >= 0) S.ev[k].splice(i, 1); } delete lastTap[id]; };
-  const push = (kind, q, base) => { const e = [t, id, kind, q]; (S.ev[m] || (S.ev[m] = [])).push(e); lastTap[id] = {t, kind, ev: e, base}; };
-  if (dir < 0) {
-    if (live && lt.kind === 'r') { lt.ev[3] = r3(lt.ev[3] - st); lt.t = t; if (lt.ev[3] <= 1e-9) drop(lt.ev); }
-    else if (s <= 1e-9) return false;
-    else if (live && lt.kind === 'c') { lt.ev[3] = r3(Math.max(0, lt.ev[3] - st)); lt.t = t; }
-    else push('c', r3(Math.max(0, s - st)), s);
+  const drop = () => { dropEv(lt.ev); (lt.deps || []).forEach(d => dropEv(d.ev)); delete lastTap[key]; };
+  const push = (kind, q, base) => { const e = [t, id, kind, q]; (S.ev[m] || (S.ev[m] = [])).push(e); return lastTap[key] = {t, kind, ev: e, base, deps: []}; };
+  if (role === 'bar') {
+    if (dir < 0) {
+      if (s <= 1e-9) { toast('Уже ноль'); return false; }
+      if (live) { lt.ev[3] = r3(Math.max(0, lt.ev[3] - st)); lt.t = t; }
+      else push('c', r3(Math.max(0, s - st)), s);
+    } else {
+      if (!live) { toast('«+» в баре — только отменить свой «−». Приготовленное отмечают во «Заготовке»'); return false; }
+      lt.ev[3] = r3(lt.ev[3] + st); lt.t = t;
+      if (lt.ev[3] >= lt.base - 1e-9) drop();
+    }
   } else {
-    if (live && lt.kind === 'c') { lt.ev[3] = r3(lt.ev[3] + st); lt.t = t; if (lt.ev[3] >= lt.base - 1e-9) drop(lt.ev); }
-    else if (live && lt.kind === 'r') { lt.ev[3] = r3(lt.ev[3] + st); lt.t = t; }
-    else push('r', st);
+    if (dir > 0) {
+      if (live) { lt.ev[3] = r3(lt.ev[3] + st); lt.t = t; syncDeps(lt.deps, lt.ev[3]); }
+      else { const p = push('r', st); p.deps = deduct(it, st, t); }
+    } else {
+      if (!live) { toast('«−» в заготовке — только отменить свой «+». Расход отмечают бармены во вкладке «Бар»'); return false; }
+      lt.ev[3] = r3(lt.ev[3] - st); lt.t = t; syncDeps(lt.deps, lt.ev[3]);
+      if (lt.ev[3] <= 1e-9) drop();
+    }
   }
   rebuild(); persistSoon(['e'+m, 'mo']);
+  const cur = lastTap[key];
+  if (role === 'prep' && cur && cur.deps.length) toast(`${it.n}: +${fmt(cur.ev[3])} ${it.u}${depsText(it, cur.deps)}`);
   return true;
 }
 ACT.bump = b => {
   const id = b.dataset.id, it = S.items.find(i => i.id === +id), st = stepOf(it);
   if (!st) return;
-  if (mode === 'c') {
-    delete drafts.c[id];
-    if (tap(it, +b.dataset.dir, st)) { try { TG.HapticFeedback.selectionChanged(); } catch(e) {} }
+  if (mode !== 'inv') {
+    delete drafts[mode][id];
+    if (tap(it, +b.dataset.dir, st, mode)) { try { TG.HapticFeedback.selectionChanged(); } catch(e) {} }
     $('#list').innerHTML = inputList(); updateSaveBar();
     return;
   }
@@ -448,10 +501,15 @@ function updateSaveBar(){
   const bar = $('#savebar');
   if (tab !== 'input' || !S.items.length) { bar.innerHTML = ''; return; }
   const n = Object.values(drafts[mode]).filter(v => String(v).trim() !== '').length;
-  const label = {c:'Сохранить остатки', inv:`Сохранить инвентаризацию · ${n} из ${S.items.length}`}[mode];
+  const label = {bar:'Сохранить остатки', prep:'Сохранить остатки', inv:`Сохранить инвентаризацию · ${n} из ${S.items.length}`}[mode];
   bar.innerHTML = `<button class="btn" data-act="save" ${n ? '' : 'disabled'}>${label}${mode !== 'inv' && n ? ` (${n})` : ''}</button>`;
 }
-ACT.mode = b => { mode = b.dataset.v; if (mode === 'inv') catF = 'all'; render(); };
+ACT.mode = b => {
+  mode = b.dataset.v;
+  if (mode === 'inv' || (mode === 'bar' && catF !== 'all' && !CATS[catF].own)) catF = 'all';
+  try { localStorage.setItem('barinv:mode', mode); } catch(e) {}
+  render();
+};
 ACT.cat = b => { catF = b.dataset.v; render(); };
 ACT.gotab = b => { tab = b.dataset.v; render(); };
 ACT.save = async () => {
@@ -463,9 +521,10 @@ ACT.save = async () => {
     const it = S.items.find(i => i.id == id);
     if (!it) continue;
     if (isNaN(v) || v < 0) { toast(`Проверь число: «${it.n}»`); return; }
-    // стало больше, чем было — приготовил или пришла поставка: разницу пишем приходом (с неё же начинается маркировка)
+    // стало больше, чем было — приготовил или пришла поставка: разницу пишем приходом (с неё же начинается маркировка).
+    // В «Баре» число — просто пересчёт: бармены не готовят
     const s = stockAt(it.id);
-    if (s != null && v > s + 1e-9) { add.push([t, +id, 'r', Math.round((v - s)*1000)/1000]); made++; }
+    if (mode !== 'bar' && s != null && v > s + 1e-9) { add.push([t, +id, 'r', r3(v - s)]); deduct(it, r3(v - s), t); made++; }
     add.push([t, +id, 'c', v]);
     counted++;
   }
@@ -541,7 +600,9 @@ function recBody(){
   const it = S.items.find(i => i.id === recId), k = recK();
   if (!it || !k) return '<div class="empty">Впиши количество</div>';
   const f = recF(it, k);
-  return `<table><tr><th>Ингредиент</th><th>на ${fmt(k)} ${byVol(it) ? esc(it.u) : 'парт.'}</th></tr>${it.rec.ing.map(([n, qn, u]) => `<tr><td>${esc(n)}</td><td><b>${qn == null ? '' : fmtQ(qn*f)}</b> ${esc(u)}</td></tr>`).join('')}</table>
+  const linked = new Set(deductPlan(it).map(d => d.it));
+  return `<table><tr><th>Ингредиент</th><th>на ${fmt(k)} ${byVol(it) ? esc(it.u) : 'парт.'}</th></tr>${it.rec.ing.map(([n, qn, u]) => `<tr><td>${esc(n)}${linked.has(ingItem(n)) ? ' <span class="sub">↓ спишется</span>' : ''}</td><td><b>${qn == null ? '' : fmtQ(qn*f)}</b> ${esc(u)}</td></tr>`).join('')}</table>
+    ${linked.size ? '<div class="note">«↓ спишется» — когда отметишь, что приготовил (+), эти ингредиенты сами уменьшатся на складе.</div>' : ''}
     ${it.rec.out ? `<div class="note">Выход: ${fmtQ(it.rec.out*f)} мл</div>` : ''}`;
 }
 ACT.rec = b => {
@@ -584,7 +645,7 @@ VIEWS.stats = () => {
   for (const m in S.ev) S.ev[m].forEach((e, i) => ev.push({e, m, i}));
   ev.sort((a,b) => b.e[0] - a.e[0]);
   const name = id => (S.items.find(i => i.id === id) || {n:'(удалена)'}).n;
-  html += `<div class="card"><h3>Журнал (последние записи)</h3>${ev.length ? ev.slice(0, 40).map(({e, m, i}) => `<div class="row"><div class="ri"><div class="nm">${esc(name(e[1]))}</div><div class="sub">${fmtDT(e[0])} · ${e[2] === 'm' ? 'перемаркировка' : (e[2] === 'c' ? 'остаток ' : e[2] === 'h' ? 'приход (из таблицы) +' : 'приход +') + fmt(e[3])}</div></div><button class="x" data-act="delev" data-m="${m}" data-i="${i}" aria-label="Удалить">×</button></div>`).join('') : '<div class="empty">Пусто</div>'}</div>`;
+  html += `<div class="card"><h3>Журнал (последние записи)</h3>${ev.length ? ev.slice(0, 40).map(({e, m, i}) => `<div class="row"><div class="ri"><div class="nm">${esc(name(e[1]))}</div><div class="sub">${fmtDT(e[0])} · ${e[2] === 'm' ? 'перемаркировка' : (e[2] === 'c' ? 'остаток ' : e[2] === 'h' ? 'приход (из таблицы) +' : 'приход +') + fmt(e[3]) + (e[4] ? ` (списано на ${esc(name(e[4]))})` : '')}</div></div><button class="x" data-act="delev" data-m="${m}" data-i="${i}" aria-label="Удалить">×</button></div>`).join('') : '<div class="empty">Пусто</div>'}</div>`;
   return html;
 };
 ACT.period = b => { period = +b.dataset.v; render(); };
