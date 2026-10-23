@@ -292,6 +292,29 @@ function batches(id){
   }
   return b.filter(x => x.q > 1e-6);
 }
+/* ---------- график барбэка (настраивается во вкладке «План») ---------- */
+const WD = ['Вс','Пн','Вт','Ср','Чт','Пт','Сб'];
+const WEEK = [1,2,3,4,5,6,0];                          // порядок показа: с понедельника
+const workDays = () => S.cfg.workDays || [3,4,5,6];    // барбэк на смене: Ср–Сб
+const mainDays = () => S.cfg.mainDays || [3,4];        // основные заготовки: Ср, Чт
+const relDays  = () => S.cfg.relDays  || [3,6];        // перемаркировка: Ср, Сб
+const dayStart = t => { const d = new Date(t*1000); d.setHours(0, 0, 0, 0); return d.getTime()/1000; };
+const addDays = (t, n) => { const d = new Date(t*1000); d.setDate(d.getDate() + n); return d.getTime()/1000; };
+const wdOf = t => new Date(t*1000).getDay();
+const fmtDay = t => `${WD[wdOf(t)]} ${fmtD(t)}`;
+// Маркировку меняют по графику, а не по часам: этикетку, поставленную в made и годную до exp, переклеивают
+// в последний день перемаркировки после дня made и не позже exp; если такого нет — в первый день перемаркировки после made
+function relabelDayFor(made, exp){
+  const rd = relDays();
+  if (!rd.length) return null;
+  let d = addDays(dayStart(made), 1), best = null;
+  for (; d <= exp; d = addDays(d, 1)) if (rd.includes(wdOf(d))) best = d;
+  if (best != null) return best;
+  for (let i = 0; i < 7; i++, d = addDays(d, 1)) if (rd.includes(wdOf(d))) return d;
+  return null;
+}
+const bySchedule = it => it.lh >= 24 && relDays().length > 0; // фреши (12 ч) переклеивают по времени, на смене
+
 // Маркировка: когда пора переклеить самую старую партию. Срок — не списание, а смена маркировки
 function shelf(it){
   if (!(it.lh > 0)) return null;
@@ -302,6 +325,10 @@ function shelf(it){
     if (!first || exp < first.exp) first = {exp, q: x.q, made: x.t};
   }
   if (!first) return null;
+  if (bySchedule(it)) {
+    const due = relabelDayFor(first.made, first.exp), today = dayStart(now());
+    if (due != null) return {...first, due, st: today >= due ? 'bad' : due - today <= 3*86400 ? 'soon' : 'ok'};
+  }
   const left = first.exp - now();
   return {...first, st: left <= 0 ? 'bad' : left < Math.min(86400, it.lh*3600*0.3) ? 'soon' : 'ok'};
 }
@@ -310,7 +337,8 @@ const fmtExp = (it, t) => it.lh < 24*7 ? fmtDT(t) : fmtD(t);
 const relabelBtn = it => `<button class="mini" data-act="relabel" data-id="${it.id}">Перемаркировал</button>`;
 function shelfText(it, sh){
   if (!sh) return '';
-  if (sh.st === 'bad') return ` · <span class="bad">пора перемаркировать</span> ${relabelBtn(it)}`;
+  if (sh.st === 'bad') return ` · <span class="bad">${sh.due === dayStart(now()) ? 'перемаркировать сегодня' : 'пора перемаркировать'}</span> ${relabelBtn(it)}`;
+  if (sh.due != null) return ` · <span class="${sh.st === 'soon' ? 'soon' : ''}">перемаркировка ${fmtDay(sh.due)}</span>`;
   return ` · <span class="${sh.st === 'soon' ? 'soon' : ''}">маркировка до ${fmtExp(it, sh.exp)}</span>`;
 }
 ACT.relabel = b => {
@@ -319,7 +347,8 @@ ACT.relabel = b => {
   const t = now(), m = monthOf(t);
   (S.ev[m] || (S.ev[m] = [])).push([t, it.id, 'm', 0]);
   rebuild(); persist(['e'+m, 'mo']); haptic('success');
-  toast(`${it.n}: новая маркировка до ${fmtExp(it, t + it.lh*3600)}`);
+  const next = bySchedule(it) ? relabelDayFor(t, t + it.lh*3600) : null;
+  toast(`${it.n}: ` + (next != null ? `следующая перемаркировка ${fmtDay(next)}` : `новая маркировка до ${fmtExp(it, t + it.lh*3600)}`));
   render();
 };
 ACT.relabelAll = () => {
@@ -547,24 +576,72 @@ ACT.save = async () => {
   window.scrollTo(0, 0);
 };
 
+// Мелкие количества в г / мл: 0,133 кг → 133 г
+const fmtU = (q, u) => (u === 'кг' || u === 'л') && q > 0 && q < 1 ? `${Math.round(q*1000)} ${u === 'кг' ? 'г' : 'мл'}` : `${fmt(q)} ${u}`;
+// Что приготовить и что заказать. Приготовить — по нормам; заказать — по нормам плюс ингредиенты по ТТК
+// для того, что надо приготовить (нет миндаля, а нужно орже — закажи миндаль). Своя заготовка-ингредиент
+// (лайм кордиал для Кавай) тоже попадает в «Приготовить», и её ингредиенты — в заказ.
+function orderCalc(){
+  const make = new Map(); // заготовка -> {qn, for: Set названий, для чего}
+  const roundUp = (it, x) => { const st = it.step > 0 ? it.step : 0.01; return r3(Math.ceil(x/st - 1e-9)*st); };
+  for (const it of S.items) {
+    if (!CATS[it.c].own) continue;
+    const s = stockAt(it.id);
+    if (s == null || !needs(it, s)) continue;
+    const qn = orderQty(it, s);
+    if (qn > 0) make.set(it, {qn, for: new Set()});
+  }
+  let use = new Map(); // ингредиент -> {q, for}
+  for (let pass = 0; pass < 6; pass++) {
+    use = new Map();
+    for (const [it, m] of make) for (const d of deductPlan(it)) {
+      const u = use.get(d.it) || {q: 0, for: new Set()};
+      u.q += d.per * m.qn; u.for.add(it.n); use.set(d.it, u);
+    }
+    let changed = false;
+    for (const [ing, u] of use) {
+      if (!CATS[ing.c].own) continue;
+      const s = stockAt(ing.id);
+      if (s == null) continue;
+      const left = s - u.q; // сколько останется после заготовок
+      const want = isNum(ing.par) && needs(ing, Math.max(0, left)) ? ing.par - left : -left;
+      if (want <= 1e-9) continue;
+      const qn = roundUp(ing, want), cur = make.get(ing);
+      if (!cur || cur.qn + 1e-9 < qn) { make.set(ing, {qn, for: new Set([...(cur ? cur.for : []), ...u.for])}); changed = true; }
+      else u.for.forEach(f => cur.for.add(f));
+    }
+    if (!changed) break;
+  }
+  const buy = [];
+  for (const it of S.items) {
+    if (CATS[it.c].own) continue;
+    const s = stockAt(it.id), u = use.get(it);
+    if (s == null) { if (u) buy.push({it, s, qn: roundUp(it, u.q), use: u, unknown: true}); continue; }
+    const left = s - (u ? u.q : 0);
+    const want = isNum(it.par) && needs(it, Math.max(0, left)) ? it.par - left : -left;
+    if (want <= 1e-9) continue;
+    const qn = isNum(it.mult) && it.mult > 0 ? Math.ceil(want/it.mult - 1e-9)*it.mult : roundUp(it, want);
+    buy.push({it, s, qn, use: u});
+  }
+  return {make: [...make].map(([it, m]) => ({it, s: stockAt(it.id), qn: m.qn, for: m.for})), buy};
+}
+
 VIEWS.order = () => {
   if (!S.items.length) return `<div class="card"><div class="empty">Сначала добавь позиции</div></div>`;
-  const make = [], buy = {}, nodata = [], exp = [];
+  const exp = [], nodata = [];
   for (const it of S.items) {
     const sh = shelf(it);
     if (sh && sh.st !== 'ok') exp.push({it, sh});
-    const s = stockAt(it.id);
-    if (s == null) { if (isNum(it.par)) nodata.push(it); continue; }
-    if (!needs(it, s)) continue;
-    const qn = orderQty(it, s);
-    if (qn <= 0) continue;
-    const row = {it, s, qn};
-    if (CATS[it.c].own) make.push(row);
-    else (buy[it.sup || 'Без поставщика'] || (buy[it.sup || 'Без поставщика'] = [])).push(row);
+    if (CATS[it.c].own && stockAt(it.id) == null && isNum(it.par)) nodata.push(it);
   }
+  const {make, buy: buyRows} = orderCalc();
+  const buy = {};
+  for (const r of buyRows) (buy[r.it.sup || 'Без поставщика'] || (buy[r.it.sup || 'Без поставщика'] = [])).push(r);
   TXT.length = 0;
-  const line = r => `<div class="row" ${hasRec(r.it) ? `data-act="rec" data-id="${r.it.id}" data-k="${r.qn}"` : ''}><div class="ri"><div class="nm">${esc(r.it.n)}</div><div class="sub">есть ${fmt(r.s)} · норма ${fmt(r.it.par)}</div></div><div class="val">${fmt(r.qn)} ${esc(r.it.u)}${hasRec(r.it) ? '<div class="mini">ТТК ›</div>' : ''}</div></div>`;
-  const block = (title, rows, text) => {
+  const forTxt = set => set && set.size ? [...set].join(', ') : '';
+  const makeLine = r => `<div class="row" ${hasRec(r.it) ? `data-act="rec" data-id="${r.it.id}" data-k="${r.qn}"` : ''}><div class="ri"><div class="nm">${esc(r.it.n)}</div><div class="sub">есть ${fmt(r.s)}${isNum(r.it.par) ? ` · норма ${fmt(r.it.par)}` : ''}${r.for.size ? ` · нужно для: ${esc(forTxt(r.for))}` : ''}</div></div><div class="val">${fmt(r.qn)} ${esc(r.it.u)}${hasRec(r.it) ? '<div class="mini">ТТК ›</div>' : ''}</div></div>`;
+  const buyLine = r => `<div class="row ${r.unknown ? 'low' : ''}"><div class="ri"><div class="nm">${esc(r.it.n)}</div><div class="sub">${r.unknown ? '<span class="soon">остаток не внесён — проверь</span>' : `есть ${fmtU(r.s, r.it.u)}`}${isNum(r.it.par) ? ` · норма ${fmtU(r.it.par, r.it.u)}` : ''}${r.use ? ` · на заготовки ${fmtU(r3(r.use.q), r.it.u)} (${esc(forTxt(r.use.for))})` : ''}</div></div><div class="val">${fmtU(r.qn, r.it.u)}</div></div>`;
+  const block = (title, rows, line, text) => {
     const i = TXT.push(text) - 1;
     return `<div class="card"><div class="hdr"><h3>${esc(title)}</h3><span><button class="mini" data-act="copy" data-i="${i}">Копировать</button>${IN_TG ? ` · <button class="mini" data-act="share" data-i="${i}">Отправить</button>` : ''}</span></div>${rows.map(line).join('')}</div>`;
   };
@@ -573,21 +650,22 @@ VIEWS.order = () => {
   const sortN = a => a.sort((x,y) => pos.get(x.it) - pos.get(y.it));
   let html = '';
   if (exp.length) {
-    exp.sort((a,b) => a.sh.exp - b.sh.exp);
+    exp.sort((a,b) => (a.sh.due ?? a.sh.exp) - (b.sh.due ?? b.sh.exp));
     const due = exp.filter(x => x.sh.st === 'bad').length;
-    html += `<div class="card"><div class="hdr"><h3>Маркировка</h3>${due > 1 ? `<button class="mini" data-act="relabelAll">Перемаркировал все (${due})</button>` : ''}</div>${exp.map(({it, sh}) => `<div class="row"><div class="ri"><div class="nm">${esc(it.n)}</div><div class="sub">маркировка от ${fmtDT(sh.made)} · каждые ${fmtLife(it.lh)}</div></div><div class="val ${sh.st}">${sh.st === 'bad' ? 'пора' : 'до ' + fmtExp(it, sh.exp)}${sh.st === 'bad' ? `<div>${relabelBtn(it)}</div>` : ''}</div></div>`).join('')}</div>`;
+    html += `<div class="card"><div class="hdr"><h3>Маркировка</h3>${due > 1 ? `<button class="mini" data-act="relabelAll">Перемаркировал все (${due})</button>` : ''}</div>${exp.map(({it, sh}) => `<div class="row"><div class="ri"><div class="nm">${esc(it.n)}</div><div class="sub">маркировка от ${fmtDT(sh.made)} · каждые ${fmtLife(it.lh)}</div></div><div class="val ${sh.st}">${sh.st === 'bad' ? (sh.due === dayStart(now()) ? 'сегодня' : 'пора') : sh.due != null ? fmtDay(sh.due) : 'до ' + fmtExp(it, sh.exp)}${sh.st === 'bad' ? `<div>${relabelBtn(it)}</div>` : ''}</div></div>`).join('')}</div>`;
+  }
+  // сначала — что заказать (без этого не приготовить), потом — что приготовить
+  for (const sup of Object.keys(buy).sort((a,b) => a.localeCompare(b, 'ru'))) {
+    const rows = sortN(buy[sup]);
+    html += block('Заказать · ' + sup, rows, buyLine, `Заказ на ${today}:\n` + rows.map(r => `— ${r.it.n}: ${fmtU(r.qn, r.it.u)}`).join('\n'));
   }
   if (make.length) {
     sortN(make);
-    html += block('Приготовить', make, `Заготовки на ${today}:\n` + make.map(r => `— ${r.it.n}: ${fmt(r.qn)} ${r.it.u}`).join('\n'));
-  }
-  for (const sup of Object.keys(buy).sort((a,b) => a.localeCompare(b, 'ru'))) {
-    const rows = sortN(buy[sup]);
-    html += block('Заказать · ' + sup, rows, `Заказ на ${today}:\n` + rows.map(r => `— ${r.it.n}: ${fmt(r.qn)} ${r.it.u}`).join('\n'));
+    html += block('Приготовить', make, makeLine, `Заготовки на ${today}:\n` + make.map(r => `— ${r.it.n}: ${fmt(r.qn)} ${r.it.u}`).join('\n'));
   }
   if (!html) html = `<div class="card"><div class="empty">Всё в норме — ничего не нужно ✓</div></div>`;
   if (nodata.length) html += `<div class="note">Нет пересчёта: ${nodata.map(i => esc(i.n)).join(', ')}</div>`;
-  return html + `<div class="note">Количество считается до нормы. Красная точка в списке — остаток ниже минимума. Нормы и минимумы меняются в «Позициях».</div>`;
+  return html + `<div class="note">«Заказать» — до нормы плюс то, что уйдёт по ТТК на заготовки из списка «Приготовить». Красная точка — остаток ниже минимума или не внесён. Нормы и минимумы меняются в «Позициях».</div>`;
 };
 const TXT = [];
 ACT.copy = b => copyText(TXT[b.dataset.i]);
@@ -687,8 +765,6 @@ ACT.inv = b => {
 const WINDOW = 14;            // сколько дней истории берём
 const PREP_H = 12;            // во сколько обычно готовишь (для времени маркировки)
 const SHIFT = 6*3600;         // бар работает за полночь: до 6 утра — ещё вчерашний день
-const WD = ['Вс','Пн','Вт','Ср','Чт','Пт','Сб'];
-const prepWd = () => S.cfg.prepWd ?? 3; // заготовочный день, по умолчанию среда
 // Сколько дней данных накоплено (максимум 14)
 function dataDays(){
   let first = Infinity;
@@ -722,52 +798,66 @@ function wdFactors(){
   const mean = acc.reduce((a,b) => a + b, 0)/7/used;
   return mean > 0 ? acc.map(x => x/used/mean) : Array(7).fill(1);
 }
-// Как часто делать: по частоте маркировки (30 сут — раз в неделю в заготовочный день, 3 сут — раз в 3 дня, 12 ч — каждый день)
-const cadence = it => !(it.lh > 0) || it.lh >= 24*7 ? 7 : Math.max(1, Math.round(it.lh/24));
-// Проигрываем 7 дней вперёд: расход по дням недели, когда и сколько готовить, когда переклеивать
+// Через сколько дней следующий день из списка (1..7)
+const nextIn = (wd, list) => { for (let k = 1; k <= 7; k++) if (list.includes((wd + k) % 7)) return k; return 7; };
+// Проигрываем 7 дней вперёд по графику барбэка:
+//  · готовим только в его смены; у каждой позиции свой «основной» день: настои (маркировка от недели) — первый
+//    основной день (Ср), остальное — последний (Чт); там делаем партию до следующего такого же дня с запасом 20%;
+//  · в другие смены (Пт, Сб) — только доделать, если не хватит до следующей смены;
+//  · фреши (маркировка в часах) — каждый день по расходу;
+//  · перемаркировка — в дни перемаркировки (Ср, Сб), фреши — по времени.
 function buildPlan(){
   const F = dataDays() >= 7 ? wdFactors() : Array(7).fill(1);
   const d0 = new Date(); d0.setHours(0, 0, 0, 0);
   const days = Array.from({length: 7}, (_, i) => { const d = new Date(d0); d.setDate(d0.getDate() + i); return {t: d.getTime()/1000, wd: d.getDay(), make: [], relabel: []}; });
+  const W = workDays().length ? workDays() : [0,1,2,3,4,5,6];
+  const order = wd => (wd + 6) % 7; // понедельник — первый
+  const M = mainDays().filter(d => W.includes(d)).sort((a,b) => order(a) - order(b));
+  const MM = M.length ? M : [...W].sort((a,b) => order(a) - order(b));
+  const gap = Math.max(...W.map(w => nextIn(w, W))); // самый длинный перерыв без барбэка (Сб → Ср = 4 дня)
   const norms = [], nodata = [];
   for (const it of S.items) {
     if (!CATS[it.c].own) continue;
     const r = dailyRate(it.id, WINDOW);
     if (!(r > 0)) { nodata.push(it); continue; }
-    const C = cadence(it), st = it.step > 0 ? it.step : 0.1;
-    const up = x => Math.round(Math.ceil(x/st - 1e-9)*st*1000)/1000;
+    const fresh = it.lh > 0 && it.lh < 24;
+    const home = fresh ? null : !(it.lh > 0) || it.lh >= 24*7 ? MM[0] : MM[MM.length - 1];
+    const st = it.step > 0 ? it.step : 0.1;
+    const up = x => r3(Math.ceil(x/st - 1e-9)*st);
     const demand = (i, k) => { let s = 0; for (let j = 0; j < k; j++) s += r*F[(days[0].wd + i + j) % 7]; return s; };
     let s = stockAt(it.id) ?? 0;
     const bs = batches(it.id).map(x => ({...x}));
     let times = 0;
     for (let i = 0; i < 7; i++) {
       const day = days[i];
-      if (C < 7 || day.wd === prepWd()) {
-        // 7-дневное — если не хватит до следующего заготовочного дня; остальное — если не хватит на сегодня
-        if (s < (C === 7 ? demand(i, 7) : demand(i, 1)*1.2)) {
-          const qn = up(Math.max(st, demand(i, C)*1.2 - s));
-          s += qn; times++;
-          bs.push({t: day.t + PREP_H*3600, q: qn});
-          day.make.push({it, q: qn});
-        }
+      let cover = 0;
+      if (fresh) { if (s < demand(i, 1)*1.2) cover = 1; }
+      else if (W.includes(day.wd)) {
+        if (day.wd === home) { if (s < demand(i, nextIn(home, [home]))) cover = nextIn(home, [home]); }
+        else if (s < demand(i, nextIn(day.wd, W))) cover = nextIn(day.wd, [home]); // доделать до основного дня
       }
-      if (it.lh > 0) { // когда переклеивать то, что ещё стоит
-        const seen = new Set();
+      if (cover) {
+        const qn = up(Math.max(st, demand(i, cover)*1.2 - s));
+        s += qn; times++;
+        bs.push({t: day.t + PREP_H*3600, q: qn});
+        day.make.push({it, q: qn, extra: !fresh && day.wd !== home});
+      }
+      if (bySchedule(it)) { // что переклеивать в дни перемаркировки (фреши — на смене по времени, в план не идут)
+        let done = false;
         for (const x of bs) {
           if (x.t == null) continue;
-          while (x.t + it.lh*3600 < day.t + 86400) {
-            x.t += it.lh*3600;
-            if (x.t >= now() && x.t >= day.t && !seen.has(x.t)) { seen.add(x.t); day.relabel.push({it, t: x.t}); }
-          }
+          const due = relabelDayFor(x.t, x.t + it.lh*3600);
+          if (due === day.t || (i === 0 && due != null && due < day.t)) { x.t = day.t + PREP_H*3600; if (!done) { day.relabel.push({it, t: null}); done = true; } }
         }
       }
       let c = demand(i, 1);
       s = Math.max(0, s - c);
       while (c > 1e-9 && bs.length) { if (bs[0].q <= c) { c -= bs[0].q; bs.shift(); } else { bs[0].q -= c; c = 0; } }
     }
-    norms.push({it, r, C, times, par: up(r*C*1.2), min: C === 7 ? Math.max(st, Math.round(r*3.5*10)/10) : null});
+    // норма — на неделю от основного дня (фреши — на день); минимум — чтобы хватило на самый длинный перерыв без барбэка
+    norms.push({it, r, home, fresh, times, par: up(r*(fresh ? 1 : 7)*1.2), min: fresh ? null : up(r*gap)});
   }
-  for (const d of days) d.relabel.sort((a,b) => a.t - b.t);
+  for (const d of days) d.relabel.sort((a,b) => (a.t ?? 0) - (b.t ?? 0));
   return {days, norms, nodata, F};
 }
 const fmtT = t => new Date(t*1000).toLocaleTimeString('ru-RU', {hour: '2-digit', minute: '2-digit'});
@@ -779,32 +869,40 @@ VIEWS.plan = () => {
   let html = `<div class="card"><h3>Данные</h3><div class="row"><div class="ri"><div class="nm">${dd} из ${WINDOW} дней</div>
     <div class="sub">${dd >= WINDOW ? 'План строится по последним 2 неделям и пересчитывается каждый раз' : `План предварительный — станет точным через ${WINDOW - dd} дн. Каждый день вноси остатки — и до того, как готовишь, и после.`}</div></div></div>
     <div style="height:6px;background:var(--bg2);border-radius:3px;margin:4px 0 12px"><div style="height:6px;width:${Math.round(dd/WINDOW*100)}%;background:var(--acc);border-radius:3px"></div></div></div>
-    <div class="note">Заготовочный день (для настоев с маркировкой от недели):</div>
-    <div class="chips" style="padding-top:4px">${[1,2,3,4,5,6,0].map(w => `<button class="chip ${prepWd() === w ? 'on' : ''}" data-act="prepwd" data-v="${w}">${WD[w]}</button>`).join('')}</div>`;
+    <div class="card"><h3>График барбэка</h3>
+      ${[['workDays', workDays(), 'На смене'], ['mainDays', mainDays(), 'Основные заготовки'], ['relDays', relDays(), 'Перемаркировка']].map(([k, list, title]) => `
+        <div class="note" style="margin-top:8px">${title}:</div>
+        <div class="chips" style="padding-top:2px">${WEEK.map(w => `<button class="chip ${list.includes(w) ? 'on' : ''}" data-act="cfgday" data-k="${k}" data-v="${w}">${WD[w]}</button>`).join('')}</div>`).join('')}
+      <div class="note">Настои делаются в первый основной день, остальное — в последний. В другие смены — только доделать, если не хватит до следующей смены. Фреши — каждый день.</div></div>`;
   if (!P.norms.length) return html + `<div class="card"><div class="empty">Пока нечего считать: нужно хотя бы 2 пересчёта по заготовкам.</div></div>`;
   TXT.length = 0;
   const lines = [];
   for (const d of P.days) {
     if (!d.make.length && !d.relabel.length) continue;
     const title = `${WD[d.wd]}, ${fmtD(d.t)}${d.t === P.days[0].t ? ' · сегодня' : ''}`;
-    lines.push(title + ':', ...d.make.map(m => `  приготовить ${m.it.n} — ${qtyTxt(m.it, m.q)}`), ...d.relabel.map(x => `  перемаркировать ${x.it.n} — ${fmtT(x.t)}`));
+    lines.push(title + ':', ...d.make.map(m => `  ${m.extra ? 'доделать' : 'приготовить'} ${m.it.n} — ${qtyTxt(m.it, m.q)}`), ...d.relabel.map(x => `  перемаркировать ${x.it.n}${x.t ? ' — ' + fmtT(x.t) : ''}`));
     html += `<div class="card"><h3>${title}</h3>
-      ${d.make.length ? d.make.map(m => `<div class="row" ${hasRec(m.it) ? `data-act="rec" data-id="${m.it.id}" data-k="${m.q}"` : ''}><div class="ri"><div class="nm">${esc(m.it.n)}</div><div class="sub">приготовить</div></div><div class="val">${qtyTxt(m.it, m.q)}${hasRec(m.it) ? '<div class="mini">ТТК ›</div>' : ''}</div></div>`).join('') : ''}
-      ${d.relabel.map(x => `<div class="row"><div class="ri"><div class="nm">${esc(x.it.n)}</div><div class="sub">перемаркировать</div></div><div class="val soon">${fmtT(x.t)}</div></div>`).join('')}</div>`;
+      ${d.make.length ? d.make.map(m => `<div class="row" ${hasRec(m.it) ? `data-act="rec" data-id="${m.it.id}" data-k="${m.q}"` : ''}><div class="ri"><div class="nm">${esc(m.it.n)}</div><div class="sub">${m.extra ? 'доделать — не хватит до следующей смены' : 'приготовить'}</div></div><div class="val">${qtyTxt(m.it, m.q)}${hasRec(m.it) ? '<div class="mini">ТТК ›</div>' : ''}</div></div>`).join('') : ''}
+      ${d.relabel.length ? `<div class="sub" style="padding:8px 0 2px">Перемаркировать (${d.relabel.length}):</div>` + d.relabel.map(x => `<div class="row"><div class="ri"><div class="nm">${esc(x.it.n)}</div></div><div class="val soon">${x.t ? fmtT(x.t) : '✓'}</div></div>`).join('') : ''}</div>`;
   }
   const ti = TXT.push('План на неделю\n' + lines.join('\n')) - 1;
   html += `<button class="btn sec" data-act="copy" data-i="${ti}">Копировать план</button>`;
-  const cad = n => n.C === 7 ? `по ${WD[prepWd()]}` : n.C === 1 ? 'каждый день' : `раз в ${n.C} дн.`;
+  const cad = n => n.fresh ? 'каждый день' : `по ${WD[n.home]}`;
   html += `<div class="card"><h3>Нормы по последним ${WINDOW} дням</h3><table><tr><th>Позиция</th><th>расход в нед</th><th>делать</th><th>норма</th></tr>
     ${P.norms.map(n => `<tr><td>${esc(n.it.n)}</td><td>${fmt(Math.round(n.r*7*100)/100)} ${esc(n.it.u)}</td><td>${cad(n)}${n.times ? `<div class="sub">в плане ×${n.times}</div>` : ''}</td><td>${fmt(n.par)}${isNum(n.it.par) && n.it.par !== n.par ? `<div class="sub">сейчас ${fmt(n.it.par)}</div>` : ''}</td></tr>`).join('')}</table>
     <button class="btn" data-act="applynorms">Применить нормы</button>
-    <div class="note">Норма — сколько держать, чтобы хватило до следующей заготовки, с запасом 20%. «Применить» запишет их в позиции, по ним работает «Заказ».</div></div>`;
+    <div class="note">Норма — сколько сделать в основной день, чтобы хватило на неделю с запасом 20%. Минимум — чтобы хватило на самый длинный перерыв без барбэка. «Применить» запишет их в позиции, по ним работает «Заказ».</div></div>`;
   const F = P.F;
   if (F.some(x => Math.abs(x - 1) > 0.05)) html += `<div class="note">Загрузка по дням недели: ${[1,2,3,4,5,6,0].map(w => `${WD[w]} ${fmt(Math.round(F[w]*10)/10)}`).join(' · ')} (1 — средний день)</div>`;
   if (P.nodata.length) html += `<div class="note">Нет данных о расходе: ${P.nodata.map(i => esc(i.n)).join(', ')}</div>`;
   return html;
 };
-ACT.prepwd = b => { S.cfg.prepWd = +b.dataset.v; persist(['it']); render(); };
+ACT.cfgday = b => {
+  const k = b.dataset.k, w = +b.dataset.v;
+  const cur = {workDays, mainDays, relDays}[k]();
+  S.cfg[k] = cur.includes(w) ? cur.filter(x => x !== w) : [...cur, w];
+  persist(['it']); render();
+};
 ACT.applynorms = async () => {
   if (!PLAN || !PLAN.norms.length) return;
   if (!await ask(`Записать нормы для ${PLAN.norms.length} позиций? Текущие нормы этих позиций заменятся.`)) return;
